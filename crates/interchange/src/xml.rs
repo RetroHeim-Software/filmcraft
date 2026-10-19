@@ -143,7 +143,60 @@ pub(crate) fn num(v: f64) -> String {
     format!("{v}")
 }
 
+/// Deepest element nesting accepted. The parser limits the number of nodes but recurses once per
+/// level, so a few thousand nested elements in a small file overflow the stack; real documents
+/// nest a few dozen levels.
+const MAX_DEPTH: usize = 128;
+
+/// The deepest element nesting of `text`, counted without parsing (stops past `limit`). Skips
+/// comments, CDATA, processing instructions and quoted attribute values.
+fn nesting_exceeds(text: &str, limit: usize) -> bool {
+    let b = text.as_bytes();
+    let (mut i, mut depth) = (0, 0usize);
+    while let Some(off) = b[i..].iter().position(|&c| c == b'<') {
+        i += off;
+        let rest = &b[i..];
+        let skip_to = |end: &[u8]| rest.windows(end.len()).position(|w| w == end).map_or(b.len(), |p| i + p + end.len());
+        if rest.starts_with(b"<!--") {
+            i = skip_to(b"-->");
+        } else if rest.starts_with(b"<![CDATA[") {
+            i = skip_to(b"]]>");
+        } else if rest.starts_with(b"<?") {
+            i = skip_to(b"?>");
+        } else if rest.starts_with(b"<!") {
+            i = skip_to(b">");
+        } else {
+            let (mut j, mut quote, mut last) = (i + 1, 0u8, 0u8);
+            while j < b.len() && (quote != 0 || b[j] != b'>') {
+                match (quote, b[j]) {
+                    (0, q @ (b'"' | b'\'')) => quote = q,
+                    (q, c) if q == c => quote = 0,
+                    _ => {}
+                }
+                last = b[j];
+                j += 1;
+            }
+            if rest.starts_with(b"</") {
+                depth = depth.saturating_sub(1);
+            } else if last != b'/' {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            i = j + 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+    }
+    false
+}
+
 pub(crate) fn parse(text: &str) -> Result<roxmltree::Document<'_>, String> {
+    if nesting_exceeds(text, MAX_DEPTH) {
+        return Err(format!("elements are nested more than {MAX_DEPTH} levels deep"));
+    }
     let opts = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
     roxmltree::Document::parse_with_options(text, opts).map_err(|e| e.to_string())
 }
@@ -168,5 +221,21 @@ mod tests {
         assert_eq!(num(100.0), "100");
         assert_eq!(num(-0.0), "0");
         assert_eq!(num(0.1 + 0.2).parse::<f64>().unwrap(), 0.1 + 0.2);
+    }
+
+    #[test]
+    fn nesting_is_counted_without_being_fooled_by_text() {
+        let tricky = r#"<a x="<<<<" y='>'><!-- <b><b><b> --><![CDATA[<c><c>]]><?pi <d>?><e/><f></f></a>"#;
+        assert!(!nesting_exceeds(tricky, 2));
+        assert!(nesting_exceeds(&"<a>".repeat(10), 9));
+        assert!(!nesting_exceeds(&"<a>".repeat(10), 10));
+        assert!(!nesting_exceeds(&format!("{}{}", "<a>".repeat(50), "</a>".repeat(50)), 50));
+    }
+
+    /// A few thousand nested elements overflowed the parser's stack.
+    #[test]
+    fn a_very_deep_document_is_refused_not_recursed_into() {
+        let deep = "<a>".repeat(5000);
+        assert!(parse(&deep).is_err());
     }
 }

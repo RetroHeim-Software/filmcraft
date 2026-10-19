@@ -19,7 +19,17 @@ struct R<'a, 'b> {
     media: HashMap<Uid, Vec<u8>>,
     doc: Document,
     sources: HashMap<(Uid, u32, String), usize>,
+    /// Objects visited while walking compositions (see [`MAX_VISITS`]).
+    visits: std::cell::Cell<usize>,
+    /// Set once the budget ran out and the cut was reported.
+    cut: bool,
 }
+
+/// How many objects one import may visit. The object graph is not a tree (any number of
+/// references can name the same object), so the depth limits alone do not bound the work: a
+/// component list that names one child 65,535 times, nested 32 deep, is 2^32+ visits from a few
+/// kilobytes. Real compositions visit a few thousand.
+const MAX_VISITS: usize = 2_000_000;
 
 pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
     let perr = |m: String| Error::Parse { format: "OMF", message: m };
@@ -27,7 +37,17 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
     let class_of = |o: u32| c.get(o, "OMFI:OOBJ:ObjClass").and_then(|v| v.get(..4).map(|b| [b[0], b[1], b[2], b[3]]));
     let head = c.objects.keys().copied().find(|&o| class_of(o) == Some(*b"HEAD")).ok_or_else(|| perr("no OMF header object".into()))?;
     let be = c.get(head, "OMFI:HEAD:ByteOrder").is_none_or(|v| v.first() != Some(&0x49));
-    let mut r = R { c: &c, report, be, mobs: HashMap::new(), media: HashMap::new(), doc: Document::default(), sources: HashMap::new() };
+    let mut r = R {
+        c: &c,
+        report,
+        be,
+        mobs: HashMap::new(),
+        media: HashMap::new(),
+        doc: Document::default(),
+        sources: HashMap::new(),
+        visits: std::cell::Cell::new(0),
+        cut: false,
+    };
     let mob_list = r.refs(head, "OMFI:HEAD:Mobs");
     let mob_list = if mob_list.is_empty() {
         c.objects.keys().copied().filter(|&o| matches!(class_of(o).as_ref(), Some(b"CMOB" | b"MMOB" | b"SMOB"))).collect()
@@ -122,8 +142,15 @@ impl R<'_, '_> {
         self.i32(o, "OMFI:CPNT:Length").unwrap_or(0).max(0)
     }
 
+    /// Count one visit; false once the budget is spent.
+    fn visit(&self) -> bool {
+        let n = self.visits.get().saturating_add(1);
+        self.visits.set(n);
+        n <= MAX_VISITS
+    }
+
     fn collect_refs(&self, o: u32, out: &mut HashSet<Uid>, depth: usize) {
-        if depth > 64 {
+        if depth > 64 || !self.visit() {
             return;
         }
         if self.class(o) == *b"SCLP"
@@ -207,6 +234,13 @@ impl R<'_, '_> {
     fn segment(&mut self, seg: u32, rate: (i64, i64), depth: usize) -> Vec<CItem> {
         let len = units_to_ticks(self.len(seg), rate.0, rate.1);
         if depth > 32 {
+            return vec![CItem::Filler(len)];
+        }
+        if !self.visit() {
+            if !self.cut {
+                self.cut = true;
+                self.report.warn("the OMF composition references the same objects too many times; the rest of it was replaced by gaps");
+            }
             return vec![CItem::Filler(len)];
         }
         match &self.class(seg) {

@@ -209,7 +209,9 @@ fn parse(text: &str, report: &mut Report) -> Parsed {
             continue;
         }
         if upper.starts_with("AUD") {
-            let extra: Vec<Ch> = l.split_whitespace().skip(1).filter_map(|t| t.parse::<usize>().ok()).map(Ch::A).collect();
+            // Same range as the channel column ([`parse_channels`]): every channel number creates a
+            // track, so an unbounded one would let a hostile list allocate without limit.
+            let extra: Vec<Ch> = l.split_whitespace().skip(1).filter_map(|t| t.parse::<usize>().ok()).filter(|n| (1..=99).contains(n)).map(Ch::A).collect();
             if let Some(line) = p.events.last_mut().and_then(|e| e.lines.last_mut()) {
                 line.chans.extend(extra);
             }
@@ -1026,5 +1028,35 @@ mod tests {
         assert_eq!(w.trans, Trans::Wipe(1));
         assert!(parse_event_line("* comment").is_none());
         assert!(parse_tc("01;00;00;02").unwrap().df);
+    }
+
+    /// `AUD 999999999` used to create a billion audio tracks (and `usize::MAX` overflowed `idx + 1`).
+    #[test]
+    fn aud_lines_are_limited_to_99_channels() {
+        let edl = "TITLE: t\nFCM: NON-DROP FRAME\n\n001  AX       V     C        01:00:00:00 01:00:01:00 00:00:00:00 00:00:01:00\nAUD 999999999 18446744073709551615 3\n";
+        let (imp, _report) = crate::import_with(edl.as_bytes(), crate::Format::Edl, &Default::default()).unwrap();
+        let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+        assert!(seq.audio_tracks.len() <= 99, "{} audio tracks", seq.audio_tracks.len());
+        assert!(seq.audio_tracks.iter().any(|t| !t.items.is_empty()), "the in-range channel 3 still lands");
+    }
+
+    /// 100,000 sequential events used to take minutes: every event rebuilt the whole track.
+    #[test]
+    fn a_long_sequential_edl_imports_in_linear_time() {
+        let mut edl = String::from("TITLE: big\nFCM: NON-DROP FRAME\n");
+        let tc = |f: u32| format!("{:02}:{:02}:{:02}:{:02}", f / 90_000, f / 1500 % 60, f / 25 % 60, f % 25);
+        for i in 0..20_000u32 {
+            edl.push_str(&format!("{:03}  AX       V     C        {} {} {} {}\n", i % 999 + 1, tc(i * 25), tc(i * 25 + 25), tc(i * 25), tc(i * 25 + 25)));
+        }
+        let started = std::time::Instant::now();
+        let (imp, _) = crate::import_with(
+            edl.as_bytes(),
+            crate::Format::Edl,
+            &crate::ImportOptions { edl_frame_rate: Some(filmcraft_time::FrameRate::FPS_25), ..Default::default() },
+        )
+        .unwrap();
+        let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+        assert_eq!(seq.video_tracks[0].items.len(), 20_000);
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
     }
 }

@@ -114,6 +114,13 @@ impl Transcript {
                 self.words[i - 1].end = s.max(self.words[i - 1].start);
             }
         }
+        // A speaker index past the limit is a damaged label (the loop below would otherwise add
+        // one "Speaker N" per index up to `u32::MAX`): the word keeps no speaker.
+        for w in &mut self.words {
+            if w.speaker.is_some_and(|s| s as usize >= MAX_SPEAKERS.max(self.speakers.len())) {
+                w.speaker = None;
+            }
+        }
         let max = self.words.iter().filter_map(|w| w.speaker).max();
         if let Some(m) = max {
             while self.speakers.len() <= m as usize {
@@ -142,6 +149,9 @@ impl Transcript {
     }
 }
 
+/// The most speaker labels [`Transcript::normalize`] will synthesise.
+pub const MAX_SPEAKERS: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +170,19 @@ mod tests {
         assert_eq!(t.words[2].end, Tick(35));
         assert_eq!(t.speakers.len(), 2);
         assert_eq!(t.speaker_name(&t.words[1]).as_deref(), Some("Speaker 2"));
+        t.check().unwrap();
+    }
+
+    /// A damaged speaker index used to make `normalize` push up to `u32::MAX` labels.
+    #[test]
+    fn normalize_does_not_synthesise_unbounded_speakers() {
+        let mut t = Transcript { words: vec![w("a", 0, 5), w("b", 5, 9)], ..Default::default() };
+        t.words[0].speaker = Some(u32::MAX);
+        t.words[1].speaker = Some(2);
+        t.normalize();
+        assert_eq!(t.words[0].speaker, None);
+        assert_eq!(t.words[1].speaker, Some(2));
+        assert_eq!(t.speakers.len(), 3);
         t.check().unwrap();
     }
 

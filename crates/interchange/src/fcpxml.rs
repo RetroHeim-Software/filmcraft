@@ -63,12 +63,22 @@ pub(crate) fn parse_time(s: &str) -> Option<Tick> {
         let q = n.div_euclid(b);
         let r = n.rem_euclid(b);
         let q = if r.checked_mul(2)? >= b.checked_abs()? { q.checked_add(1)? } else { q };
-        return i64::try_from(q).ok().map(Tick);
+        return in_range(i64::try_from(q).ok()?);
     }
     if let Ok(i) = s.parse::<i64>() {
-        return i.checked_mul(TICKS_PER_SECOND).map(Tick);
+        return in_range(i.checked_mul(TICKS_PER_SECOND)?);
     }
-    s.parse::<f64>().ok().map(Tick::from_seconds_f64)
+    let f = s.parse::<f64>().ok()?;
+    if !f.is_finite() || f.abs() > Tick::MAX.seconds() {
+        return None;
+    }
+    in_range(Tick::from_seconds_f64(f).0)
+}
+
+/// A document time within `±Tick::MAX` (about 100 days), so the sums and differences the importer
+/// takes of several of them cannot overflow `i64`. Anything longer is not a real timeline.
+fn in_range(ticks: i64) -> Option<Tick> {
+    (ticks.unsigned_abs() <= Tick::MAX.0.unsigned_abs()).then_some(Tick(ticks))
 }
 
 /// Format ticks as an FCPXML rational time, frame-based at `rate` when the value is on a frame.
@@ -135,7 +145,14 @@ struct Imp<'a, 'i, 'r> {
     media_nodes: HashMap<String, Node<'a, 'i>>,
     media_items: HashMap<String, ItemId>,
     effects: HashMap<String, String>,
+    /// How deep the storyline elements being laid out are nested (connected clips and secondary
+    /// storylines recurse); bounded by [`MAX_NESTING`] so deep input cannot exhaust the stack.
+    depth: usize,
 }
+
+/// Deepest nesting of connected clips / secondary storylines that is imported. Real projects use
+/// two or three levels; the parser limits the number of nodes but not their depth.
+const MAX_NESTING: usize = 16;
 
 /// Placement context of a storyline element.
 struct Ctx {
@@ -166,6 +183,7 @@ pub(crate) fn import(text: &str, opts: &ImportOptions, report: &mut Report) -> R
         media_nodes: HashMap::new(),
         media_items: HashMap::new(),
         effects: HashMap::new(),
+        depth: 0,
     };
     if let Some(res) = child(root, "resources") {
         for r in elements(res) {
@@ -373,7 +391,27 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
     }
 
     /// Lay out one storyline element at timeline time `t0`. Returns (timeline end, video clip).
+    /// Elements nested deeper than [`MAX_NESTING`] are skipped with a warning.
     fn element(&mut self, seq: &mut Sequence, ctx: &Ctx, el: Node<'a, 'i>, t0: Tick, lane: i32, primary: bool) -> (Tick, Option<filmcraft_project::ClipId>) {
+        if self.depth >= MAX_NESTING {
+            self.report.warn(format!("FCPXML elements nested more than {MAX_NESTING} levels deep were skipped"));
+            return (t0 + attr_time(el, "duration").unwrap_or(Tick::ZERO), None);
+        }
+        self.depth += 1;
+        let out = self.element_at_depth(seq, ctx, el, t0, lane, primary);
+        self.depth -= 1;
+        out
+    }
+
+    fn element_at_depth(
+        &mut self,
+        seq: &mut Sequence,
+        ctx: &Ctx,
+        el: Node<'a, 'i>,
+        t0: Tick,
+        lane: i32,
+        primary: bool,
+    ) -> (Tick, Option<filmcraft_project::ClipId>) {
         let tag = el.tag_name().name();
         let dur = attr_time(el, "duration").unwrap_or(Tick::ZERO);
         let local_start = attr_time(el, "start").unwrap_or(Tick::ZERO);
@@ -407,7 +445,7 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             }
             _ => None,
         };
-        let (speed, reverse, hold, src_base) = time_map(el, local_start);
+        let (speed, reverse, hold, src_base) = time_map(el, local_start, self.report);
         if let Some((item, origin, has_v, has_a)) = media
             && dur > Tick::ZERO
         {
@@ -605,7 +643,11 @@ fn parse_db(v: &str) -> f64 {
 }
 
 /// (speed, reverse, freeze, source time at the element's local start) from a `timeMap`.
-fn time_map(el: Node, local_start: Tick) -> (f64, bool, bool, Tick) {
+///
+/// The points come from an untrusted document: a map whose first and last point share a time but
+/// not a value (an infinite speed) is ignored with a warning, and every tick is range-checked by
+/// [`parse_time`] so the differences below cannot overflow.
+fn time_map(el: Node, local_start: Tick, report: &mut Report) -> (f64, bool, bool, Tick) {
     let Some(tm) = child(el, "timeMap") else { return (1.0, false, false, local_start) };
     let pts: Vec<(Tick, Tick)> = children(tm, "timept").filter_map(|p| Some((attr_time(p, "time")?, attr_time(p, "value")?))).collect();
     if pts.len() < 2 {
@@ -613,13 +655,25 @@ fn time_map(el: Node, local_start: Tick) -> (f64, bool, bool, Tick) {
     }
     let (t0, v0) = pts[0];
     let (t1, v1) = pts[pts.len() - 1];
-    let dt = (t1 - t0).0 as f64;
-    let dv = (v1 - v0).0 as f64;
-    let at_start = |s: f64| v0 + Tick(((local_start - t0).0 as f64 * s).round() as i64);
+    let (dt, dv) = ((t1.0 - t0.0) as f64, (v1.0 - v0.0) as f64);
     if dv == 0.0 {
         return (1.0, false, true, v0);
     }
+    if dt == 0.0 {
+        report.warn("an FCPXML timeMap whose first and last points share a time but not a value was ignored");
+        return (1.0, false, false, v0);
+    }
     let s = (dv / dt * 1_000_000.0).round() / 1_000_000.0;
+    // Offset of the element's start inside the map, as source time; clamped so a huge speed
+    // cannot overflow the sum with `v0`.
+    let at_start = |s: f64| {
+        let off = ((local_start.0 - t0.0) as f64 * s).round().clamp(-(Tick::MAX.0 as f64), Tick::MAX.0 as f64) as i64;
+        Tick(v0.0 + off)
+    };
+    if !s.is_finite() || s == 0.0 {
+        report.warn("an FCPXML timeMap with an unusable speed was ignored");
+        return (1.0, false, false, v0);
+    }
     if s < 0.0 {
         // Reverse: source runs from v0 down; our source_in is the lowest source time used.
         let speed = -s;
@@ -1206,5 +1260,67 @@ mod tests {
         assert_eq!(parse_time(&fmt_time(odd, r)), Some(odd));
         assert_eq!(rate_from_frame_duration("1001/30000s"), Some(FrameRate::FPS_29_97));
         assert_eq!(rate_from_frame_duration("100/2500s"), Some(FrameRate::FPS_25));
+    }
+
+    fn doc_with_time_map(points: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><fcpxml version="1.10"><resources><format id="r1" frameDuration="1001/24000s" width="1920" height="1080"/><asset id="r2" name="a" start="0s" duration="10s" hasVideo="1" format="r1"><media-rep kind="original-media" src="file:///m/a.mov"/></asset></resources><library><event name="e"><project name="p"><sequence format="r1" duration="10s" tcStart="0s"><spine><asset-clip ref="r2" offset="0s" start="0s" duration="5s" name="c"><timeMap>{points}</timeMap></asset-clip></spine></sequence></project></event></library></fcpxml>"#
+        )
+    }
+
+    /// Two points at one time with different values are an infinite speed: the map is ignored
+    /// (with a warning) instead of storing an infinite speed on the clip.
+    #[test]
+    fn a_time_map_with_equal_times_and_different_values_is_ignored() {
+        let doc = doc_with_time_map(r#"<timept time="0s" value="0s"/><timept time="0s" value="5s"/>"#);
+        let (imp, report) = crate::import_with(doc.as_bytes(), crate::Format::Fcpxml, &Default::default()).unwrap();
+        assert!(report.mentions("timeMap"), "{report}");
+        for it in imp.project.items.values() {
+            if let Some(seq) = it.as_sequence() {
+                for t in seq.all_tracks() {
+                    for c in &t.items {
+                        assert!(c.speed.is_finite(), "{}", c.speed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Times near the `i64` limit used to overflow the differences `time_map` takes of them.
+    #[test]
+    fn a_time_map_with_enormous_times_does_not_overflow() {
+        let doc = doc_with_time_map(r#"<timept time="-9000000s" value="-9000000s"/><timept time="9000000s" value="9000000s"/>"#);
+        assert!(crate::import_with(doc.as_bytes(), crate::Format::Fcpxml, &Default::default()).is_ok());
+        assert_eq!(parse_time("90000000000s"), None);
+        assert_eq!(parse_time("9e12s"), None);
+        assert_eq!(parse_time("nans"), None);
+        assert_eq!(parse_time("1000000s"), Some(Tick(1_000_000 * TICKS_PER_SECOND)));
+    }
+
+    #[test]
+    fn scaling_by_a_huge_speed_saturates() {
+        assert_eq!(scaled(Tick(Tick::MAX.0), 999_999.0), Tick::MAX);
+        assert_eq!(scaled(Tick(Tick::MAX.0), 1e30), Tick::MAX);
+        assert_eq!(scaled(Tick(2), 3.0), Tick(6));
+    }
+
+    /// A chain of connected clips nested deeper than the layout bound is cut off with a warning.
+    #[test]
+    fn deeply_nested_connected_clips_are_cut_off_not_recursed_into() {
+        let n: usize = 60;
+        let mut inner = String::new();
+        for _ in 0..n {
+            inner.push_str(r#"<asset-clip ref="r2" lane="1" offset="0s" duration="1s" name="c">"#);
+        }
+        for _ in 0..n {
+            inner.push_str("</asset-clip>");
+        }
+        let doc = doc_with_time_map("").replace("<timeMap></timeMap>", &inner);
+        // (a thread with a generous stack: this crate's tests are built unoptimised)
+        let handle = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || crate::import_with(doc.as_bytes(), crate::Format::Fcpxml, &Default::default()).map(|(_, r)| r.mentions("levels deep")))
+            .unwrap();
+        assert_eq!(handle.join().unwrap(), Ok(true));
     }
 }

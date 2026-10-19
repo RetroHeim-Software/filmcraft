@@ -199,3 +199,32 @@ fn mutation_never_panics_or_hangs() {
         }
     }
 }
+
+/// A 1 MiB file with 64 KiB sectors whose header lists one FAT sector 17 times, so the FAT has
+/// 278,528 entries, and whose directory sector loops onto itself. The chain walk must stop after
+/// the file's own sector count (16), not after the FAT length: 278,528 copies of 64 KiB is 18 GB.
+#[test]
+fn looping_directory_chain_is_bounded_by_the_file_not_the_fat() {
+    let mut b = vec![0u8; 1 << 20];
+    b[..8].copy_from_slice(&SIGNATURE);
+    b[26..28].copy_from_slice(&4u16.to_le_bytes());
+    b[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    b[30..32].copy_from_slice(&16u16.to_le_bytes());
+    b[32..34].copy_from_slice(&6u16.to_le_bytes());
+    b[44..48].copy_from_slice(&17u32.to_le_bytes());
+    b[48..52].copy_from_slice(&1u32.to_le_bytes());
+    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b[60..64].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    b[68..72].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    for i in 0..109 {
+        let v = if i < 17 { 0u32 } else { FREESECT };
+        b[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // sector 0 (file offset 64 KiB) is the FAT: every entry free except 1 -> 1 (a self-loop)
+    for i in 0..(1 << 16) / 4 {
+        let v = if i == 1 { 1u32 } else { FREESECT };
+        b[65536 + i * 4..65536 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let err = CompoundFile::open(&b).unwrap_err();
+    assert!(err.to_string().contains("loops"), "{err}");
+}

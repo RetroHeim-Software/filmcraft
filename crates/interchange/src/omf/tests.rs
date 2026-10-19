@@ -190,3 +190,48 @@ fn bento_values_round_trip() {
     assert_eq!(c.name_of(c.id_of("Test:Big").unwrap()), Some("Test:Big"));
     assert!(Container::open(&bytes[..bytes.len() - 1]).is_err());
 }
+
+/// A chain of 31 sequences that each list the next one twice is 2^31 segments from a few hundred
+/// bytes. The import must finish (with the rest replaced by gaps) instead of allocating them.
+#[test]
+fn a_self_fanning_sequence_is_cut_off_by_the_visit_budget() {
+    fn keys(ids: &[u32]) -> Vec<u8> {
+        let mut v = (ids.len() as u16).to_be_bytes().to_vec();
+        for id in ids {
+            v.extend_from_slice(&id.to_be_bytes());
+        }
+        v
+    }
+    let mut w = bento::Writer::new();
+    let head = w.new_object();
+    w.set(head, "OMFI:OOBJ:ObjClass", "omfi:ClassID", b"HEAD");
+    let kind = w.new_object();
+    w.set(kind, "OMFI:DDEF:DataKindID", "omfi:UniqueName", b"omfi:data:Sound\0");
+    let mob = w.new_object();
+    w.set(mob, "OMFI:OOBJ:ObjClass", "omfi:ClassID", b"CMOB");
+    let slot = w.new_object();
+    w.set(slot, "OMFI:OOBJ:ObjClass", "omfi:ClassID", b"MSLT");
+    w.set(mob, "OMFI:MOBJ:Slots", "omfi:ObjRefArray", &keys(&[slot]));
+    let mut rate = 48_000i32.to_be_bytes().to_vec();
+    rate.extend_from_slice(&1i32.to_be_bytes());
+    w.set(slot, "OMFI:MSLT:EditRate", "omfi:Rational", &rate);
+    let mut chain = Vec::new();
+    for _ in 0..32 {
+        let o = w.new_object();
+        w.set(o, "OMFI:OOBJ:ObjClass", "omfi:ClassID", b"SEQU");
+        w.set(o, "OMFI:CPNT:DataKind", "omfi:ObjRef", &kind.to_be_bytes());
+        w.set(o, "OMFI:CPNT:Length", "omfi:Int32", &100i32.to_be_bytes());
+        chain.push(o);
+    }
+    for i in 0..chain.len() {
+        if let Some(&next) = chain.get(i + 1) {
+            w.set(chain[i], "OMFI:SEQU:Components", "omfi:ObjRefArray", &keys(&[next, next]));
+        }
+    }
+    w.set(slot, "OMFI:MSLT:Segment", "omfi:ObjRef", &chain[0].to_be_bytes());
+    let bytes = w.finish();
+    let started = std::time::Instant::now();
+    let (_, report) = crate::import_with(&bytes, crate::Format::Omf, &Default::default()).unwrap();
+    assert!(report.mentions("too many times"), "{report}");
+    assert!(started.elapsed().as_secs() < 30);
+}

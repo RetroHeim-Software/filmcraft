@@ -34,6 +34,41 @@ pub(crate) fn fnv(s: &[u8], h: u64) -> u64 {
     s.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3))
 }
 
+/// Id of composition `n` (0 = the exported sequence, then the nested ones) of `doc`.
+///
+/// Master, tape and file mobs are identified by the media alone (`seed`), so re-exporting a
+/// trimmed edit of the same media keeps their ids. The composition is different: it is the edit
+/// itself, and two different edits must not claim the same MobID, so its id hashes the complete
+/// document (every composition, track, item, transition and source field) on top of `seed`.
+pub(crate) fn composition_mob_id(seed: u64, doc: &Document, n: u64) -> [u8; 32] {
+    use std::fmt::Write;
+    /// Folds formatted text into an FNV hash without building the string.
+    struct Fnv(u64);
+    impl Write for Fnv {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 = fnv(s.as_bytes(), self.0);
+            Ok(())
+        }
+    }
+    let mut h = Fnv(seed ^ 0xC0DE_C0DE_C0DE_C0DE);
+    // The compositions are the edit; format them whole. (Writing to `Fnv` cannot fail.)
+    let _ = write!(h, "{:?}|{:?}", doc.compositions, doc.nested);
+    for s in &doc.sources {
+        // Embedded essence can be large: hash its bytes directly instead of formatting them.
+        let embedded = s.embedded.as_deref().map(|e| (e.len(), fnv(e, 0xCBF2_9CE4_8422_2325)));
+        let _ = write!(
+            h,
+            "|{:?}",
+            (
+                (&s.key, &s.name, s.kind, &s.path, s.channel, s.channels, s.file_channels),
+                (s.width, s.height, s.frame_rate, s.sample_rate, s.bits, s.length, s.offset),
+                (s.start_tc, s.tc_rate, embedded, &s.markers, s.nested)
+            )
+        );
+    }
+    mob_id(h.0, n)
+}
+
 fn timestamp() -> Vec<u8> {
     // 1970-01-01 00:00:00.00: FilmCraft writes reproducible files
     let mut v = 1970i16.to_le_bytes().to_vec();
@@ -246,7 +281,7 @@ pub(crate) fn write(doc: &Document, version: filmcraft_cfb::Version, report: &mu
     // ---- nested compositions: a clip refers to one as it does to a master mob, through the
     // composition's first track of the clip's kind (a broken-out channel: that channel's track)
     let mut refs = Refs { mobs: master_ref, rates: HashMap::new() };
-    let nested_ids: Vec<[u8; 32]> = doc.nested.iter().map(|_| new_id()).collect();
+    let nested_ids: Vec<[u8; 32]> = (0..doc.nested.len()).map(|i| composition_mob_id(seed, doc, 1 + i as u64)).collect();
     for (si, s) in doc.sources.iter().enumerate() {
         let Some((comp, id)) = s.nested.and_then(|n| Some((doc.nested.get(n)?, nested_ids.get(n)?))) else { continue };
         let of_kind: Vec<usize> = comp.tracks.iter().enumerate().filter(|(_, t)| t.kind == s.kind).map(|(i, _)| i).collect();
@@ -260,7 +295,7 @@ pub(crate) fn write(doc: &Document, version: filmcraft_cfb::Version, report: &mu
     }
 
     // ---- the compositions: the exported sequence first
-    let comp_id = new_id();
+    let comp_id = composition_mob_id(seed, doc, 0);
     let top = composition_mob(&mut w, doc, comp, comp_id, true, &refs, &mut used_ops, &mut uses_varying);
     mobs.insert(0, top);
     for (k, (nested, id)) in doc.nested.iter().zip(&nested_ids).enumerate() {
@@ -692,4 +727,47 @@ fn descriptor(w: &mut W, s: &Source) -> Obj {
         d.set(pid::LOCATOR, Value::StrongVec(vec![Obj::new(cls::NETWORK_LOCATOR).data_prop(pid::URL_STRING, utf16z(&url))]));
     }
     d
+}
+
+#[cfg(test)]
+mod composition_id_tests {
+    use super::*;
+    use crate::comp::{CClip, CTrack};
+    use filmcraft_time::FrameRate;
+
+    fn doc(len: i64, start: i64) -> Document {
+        let comp = Composition {
+            name: "seq".into(),
+            rate: FrameRate::FPS_24,
+            sample_rate: 48_000,
+            width: 1920,
+            height: 1080,
+            start_tc: 0,
+            drop: false,
+            tracks: vec![CTrack {
+                kind: CKind::Picture,
+                name: "V1".into(),
+                number: 1,
+                channels: 0,
+                items: vec![CItem::Clip(CClip { len: Tick(len), source: 0, start: Tick(start), gain: None, name: "c".into() })],
+            }],
+            markers: Vec::new(),
+        };
+        Document { compositions: vec![comp], sources: Vec::new(), nested: Vec::new() }
+    }
+
+    #[test]
+    fn the_same_edit_has_the_same_composition_id() {
+        assert_eq!(composition_mob_id(7, &doc(10, 0), 0), composition_mob_id(7, &doc(10, 0), 0));
+    }
+
+    /// A clip trim used to leave the seed (name, sources, track count) unchanged, so two
+    /// different edits wrote the same CompositionMob id.
+    #[test]
+    fn a_trim_or_a_slip_changes_the_composition_id() {
+        let base = composition_mob_id(7, &doc(10, 0), 0);
+        assert_ne!(base, composition_mob_id(7, &doc(11, 0), 0));
+        assert_ne!(base, composition_mob_id(7, &doc(10, 1), 0));
+        assert_ne!(base, composition_mob_id(7, &doc(10, 0), 1));
+    }
 }

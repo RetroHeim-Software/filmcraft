@@ -169,12 +169,16 @@ impl<'a> CompoundFile<'a> {
         let mut out = Vec::new();
         let mut s = start;
         let mut steps = 0usize;
+        // A chain longer than the file has sectors must revisit one. The FAT can be far longer
+        // than the file (one FAT sector may be listed many times), so it alone does not bound the
+        // output: every step copies a whole sector.
+        let max_steps = self.fat.len().min(self.data.len() / self.sector_size).max(1);
         while s != ENDOFCHAIN {
             if s > MAXREGSECT {
                 return Err(invalid(format!("bad sector {s:#x} in a chain")));
             }
             steps += 1;
-            if steps > self.fat.len().max(1) {
+            if steps > max_steps {
                 return Err(invalid("sector chain loops"));
             }
             let b = self.sector(s)?;
@@ -205,7 +209,7 @@ impl<'a> CompoundFile<'a> {
                 return Err(invalid("mini stream chain ends early"));
             }
             steps += 1;
-            if steps > self.minifat.len().max(1) {
+            if steps > self.minifat.len().min(self.mini_stream.len() / MINI_SECTOR_SIZE).max(1) {
                 return Err(invalid("mini sector chain loops"));
             }
             let at = s as usize * MINI_SECTOR_SIZE;

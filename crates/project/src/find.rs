@@ -188,11 +188,9 @@ impl FindQuery {
     pub fn find(&self, p: &Project) -> Vec<ItemId> {
         let mut order = Vec::new();
         p.root.all_items(&mut order);
-        for id in p.items.keys() {
-            if !order.contains(id) {
-                order.push(*id);
-            }
-        }
+        // (a set, not `order.contains`: that made the ordering quadratic in the item count)
+        let in_bins: std::collections::HashSet<ItemId> = order.iter().copied().collect();
+        order.extend(p.items.keys().filter(|id| !in_bins.contains(id)).copied());
         order.into_iter().filter(|id| p.item(*id).is_some_and(|it| self.matches(p, it))).collect()
     }
 }
@@ -248,5 +246,15 @@ mod tests {
         assert!(FindQuery::default().find(&p).is_empty());
         assert_eq!(FindOp::from_name("Begins With"), Some(FindOp::BeginsWith));
         assert_eq!(FindOp::from_name("doesNotContain"), Some(FindOp::DoesNotContain));
+    }
+
+    /// Items outside every bin follow the binned ones, in id order (the order is unchanged by
+    /// the set-based membership test).
+    #[test]
+    fn items_outside_bins_come_after_binned_ones() {
+        let (mut p, a, b) = project();
+        // `a` stays in the project but leaves every bin
+        assert!(p.root.remove_item(a));
+        assert_eq!(FindQuery::simple("Media Type", FindOp::Matches, "sequence").find(&p), vec![b, a]);
     }
 }

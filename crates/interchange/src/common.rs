@@ -535,9 +535,12 @@ pub(crate) fn settings_for(rate: FrameRate, width: u32, height: u32, drop_frame:
 }
 
 /// Source time advanced by a timeline duration at `speed` (exact for integral speeds).
+///
+/// Documents are untrusted: the product saturates at `±Tick::MAX` instead of overflowing.
 pub(crate) fn scaled(d: Tick, speed: f64) -> Tick {
     let s = speed.abs();
-    if s == s.round() && s < 1e6 { Tick(d.0 * s as i64) } else { Tick((d.0 as f64 * s).round() as i64) }
+    let wide = if s == s.round() && s < 1e6 { i128::from(d.0) * i128::from(s as i64) } else { (d.0 as f64 * s).round() as i128 };
+    Tick(wide.clamp(i128::from(Tick::MIN.0), i128::from(Tick::MAX.0)) as i64)
 }
 
 /// Timeline duration of a source duration at `speed`.
@@ -551,6 +554,12 @@ pub(crate) fn unscaled(d: Tick, speed: f64) -> Tick {
 
 /// Overwrite `item` onto `track` (EDL record semantics): whatever was under it is trimmed/split.
 pub(crate) fn overwrite(track: &mut Track, item: TrackItem, alloc: &mut dyn FnMut() -> u64) {
+    // The usual edit appends after everything on the track (events in record order): nothing is
+    // trimmed or split, and rebuilding the whole track for each of 100,000 events was quadratic.
+    if track.items.last().is_none_or(|l| l.end() <= item.start) {
+        track.items.push(item);
+        return;
+    }
     let (s, e) = (item.start, item.end());
     let mut out = Vec::with_capacity(track.items.len() + 2);
     for o in track.items.drain(..) {

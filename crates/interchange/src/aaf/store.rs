@@ -400,6 +400,10 @@ struct R<'a> {
     cf: CompoundFile<'a>,
     paths: Vec<Vec<u16>>,
     objects: usize,
+    /// Directory entries already parsed as an object. A strong reference means single ownership,
+    /// so reaching a storage a second time is a malformed file; without this a small file that
+    /// lists one child many times, nested, expands into an enormous object tree.
+    seen: std::collections::HashSet<usize>,
 }
 
 const MAX_DEPTH: usize = 200;
@@ -426,7 +430,7 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Obj, String> {
             }
         }
     }
-    let mut r = R { cf, paths, objects: 0 };
+    let mut r = R { cf, paths, objects: 0, seen: Default::default() };
     r.obj(0, 0)
 }
 
@@ -454,6 +458,9 @@ impl R<'_> {
         self.objects += 1;
         if self.objects > MAX_OBJECTS {
             return Err(bad("too many objects"));
+        }
+        if !self.seen.insert(entry) {
+            return Err(bad("a storage is referenced more than once"));
         }
         let e = self.cf.entry(entry).ok_or_else(|| bad("bad directory entry"))?;
         if !matches!(e.kind, EntryKind::Root | EntryKind::Storage) {
@@ -532,5 +539,51 @@ impl R<'_> {
             o.props.push((pid, value));
         }
         Ok(o)
+    }
+}
+
+#[cfg(test)]
+mod shared_child_tests {
+    use super::*;
+
+    fn props(entries: &[(u16, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut p = vec![BYTE_ORDER_LE, FORMAT_VERSION];
+        p.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (pid, sf, v) in entries {
+            p.extend_from_slice(&pid.to_le_bytes());
+            p.extend_from_slice(&sf.to_le_bytes());
+            p.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        }
+        for (_, _, v) in entries {
+            p.extend_from_slice(v);
+        }
+        p
+    }
+
+    /// A root whose strong vector lists the one child storage `V{0}` `times` times.
+    fn root_listing_one_child(times: u32) -> Vec<u8> {
+        let mut w = Writer::new(Version::V3);
+        let child = w.storage(Writer::ROOT, "V{0}", [0; 16]).unwrap();
+        w.stream(child, "properties", props(&[])).unwrap();
+        let mut index = times.to_le_bytes().to_vec();
+        index.extend_from_slice(&[0; 8]);
+        for _ in 0..times {
+            index.extend_from_slice(&0u32.to_le_bytes());
+        }
+        w.stream(Writer::ROOT, "V index", index).unwrap();
+        w.stream(Writer::ROOT, "properties", props(&[(0x1001, SF_STRONG_VECTOR, utf16z("V"))])).unwrap();
+        w.finish()
+    }
+
+    #[test]
+    fn a_child_listed_once_reads() {
+        assert!(read(&root_listing_one_child(1)).is_ok());
+    }
+
+    /// Listing one storage twice used to parse it twice (and nested, exponentially often).
+    #[test]
+    fn a_child_listed_twice_is_refused() {
+        let err = read(&root_listing_one_child(2)).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
     }
 }

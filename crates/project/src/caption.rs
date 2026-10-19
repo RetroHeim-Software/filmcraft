@@ -233,35 +233,45 @@ impl CaptionTrack {
 }
 
 /// Strip `<…>` tags and decode the common HTML/WebVTT entities.
+///
+/// Captions come from imported SRT/WebVTT files, so the cost must be linear in the text: every
+/// scan goes forward from the current position and jumps past what it found, and once a search
+/// for a closing `>` / `}` fails no later opener searches again (`"<<<<<…"` would otherwise rescan
+/// the rest for each `<`).
 pub fn plain_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = s.char_indices().peekable();
+    let (mut no_gt, mut no_brace) = (false, false);
+    // Skip every char before byte offset `to`.
+    fn skip_to(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, to: usize) {
+        while chars.peek().is_some_and(|(j, _)| *j < to) {
+            chars.next();
+        }
+    }
+    while let Some((i, c)) = chars.next() {
         match c {
             '<' => {
                 // a tag runs to the next '>' (if none, keep the '<' literally)
-                let rest: String = chars.clone().collect();
-                if let Some(end) = rest.find('>') {
-                    for _ in 0..rest[..=end].chars().count() {
-                        chars.next();
+                match if no_gt { None } else { s[i + 1..].find('>') } {
+                    Some(end) => skip_to(&mut chars, i + 1 + end + 1),
+                    None => {
+                        no_gt = true;
+                        out.push('<');
                     }
-                } else {
-                    out.push('<');
                 }
             }
-            '{' if chars.peek() == Some(&'\\') => {
+            '{' if chars.peek().map(|(_, c)| *c) == Some('\\') => {
                 // SSA-style override blocks some SRT files carry: {\an8}
-                let rest: String = chars.clone().collect();
-                if let Some(end) = rest.find('}') {
-                    for _ in 0..rest[..=end].chars().count() {
-                        chars.next();
+                match if no_brace { None } else { s[i + 1..].find('}') } {
+                    Some(end) => skip_to(&mut chars, i + 1 + end + 1),
+                    None => {
+                        no_brace = true;
+                        out.push('{');
                     }
-                } else {
-                    out.push('{');
                 }
             }
             '&' => {
-                let rest: String = chars.clone().take(8).collect();
+                let rest: String = s[i + 1..].chars().take(8).collect();
                 let ents = [
                     ("amp;", '&'),
                     ("lt;", '<'),
@@ -273,9 +283,7 @@ pub fn plain_text(s: &str) -> String {
                     ("rlm;", '\u{200f}'),
                 ];
                 if let Some((name, ch)) = ents.iter().find(|(n, _)| rest.starts_with(n)) {
-                    for _ in 0..name.len() {
-                        chars.next();
-                    }
+                    skip_to(&mut chars, i + 1 + name.len());
                     out.push(*ch);
                 } else {
                     out.push('&');
@@ -298,6 +306,20 @@ mod tests {
         assert_eq!(plain_text("{\\an8}Top"), "Top");
         assert_eq!(plain_text("a < b"), "a < b");
         assert_eq!(plain_text("<v Bob>Hi</v>"), "Hi");
+        assert_eq!(plain_text("é<i>à</i>&lt;{\\an8}ü{x"), "éà<ü{x");
+    }
+
+    /// A megabyte of `<` used to copy the rest of the text for every one (quadratic).
+    #[test]
+    fn plain_text_is_linear_on_hostile_input() {
+        let started = std::time::Instant::now();
+        let lt = "<".repeat(1 << 20);
+        assert_eq!(plain_text(&lt).len(), 1 << 20);
+        let braces = "{\\".repeat(1 << 19);
+        assert_eq!(plain_text(&braces).len(), 1 << 20);
+        let tags = "<i>".repeat(1 << 19);
+        assert_eq!(plain_text(&tags), "");
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
     }
 
     #[test]

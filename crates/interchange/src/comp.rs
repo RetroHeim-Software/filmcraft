@@ -985,7 +985,9 @@ pub(crate) fn units_to_ticks(n: i64, num: i64, den: i64) -> Tick {
     if num <= 0 || den <= 0 {
         return Tick::ZERO;
     }
-    let t = n as i128 * den as i128 * TICKS_PER_SECOND as i128;
+    // `n` and `den` come from the document: the product of three large values overflows `i128`
+    // (a panic in debug, a wrong time in release), so it saturates and the clamp below decides.
+    let t = (n as i128).saturating_mul(den as i128).saturating_mul(TICKS_PER_SECOND as i128);
     let q = t.div_euclid(num as i128);
     let r = t.rem_euclid(num as i128);
     // documents are untrusted: keep every time far from overflow (±3 days)
@@ -1003,4 +1005,18 @@ pub(crate) fn ticks_to_units(t: Tick, num: i64, den: i64) -> (i64, bool) {
     let r = x.rem_euclid(d);
     let n = q + if r * 2 >= d { 1 } else { 0 };
     (n.clamp(i64::MIN as i128, i64::MAX as i128) as i64, r == 0)
+}
+
+#[cfg(test)]
+mod hostile_unit_tests {
+    use super::*;
+
+    #[test]
+    fn units_to_ticks_saturates_instead_of_overflowing() {
+        assert_eq!(units_to_ticks(i64::MAX, 1, i64::MAX), MAX_TIME);
+        assert_eq!(units_to_ticks(i64::MIN, 1, i64::MAX), Tick(-MAX_TIME.0));
+        assert_eq!(units_to_ticks(i64::MAX, 1, i32::MAX as i64), MAX_TIME);
+        assert_eq!(units_to_ticks(48_000, 48_000, 1), Tick(TICKS_PER_SECOND));
+        assert_eq!(units_to_ticks(1, 0, 1), Tick::ZERO);
+    }
 }
