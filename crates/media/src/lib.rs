@@ -229,4 +229,67 @@ impl MediaSource for OfflineSource {
     fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
         Ok(AudioBuffer::silence(sample_rate, self.info.audio().map_or(2, |a| a.channels as usize), frames))
     }
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
+        match self.info.audio_streams.get(stream) {
+            // The channel count comes from the (untrusted) file metadata: bound it like the stream count.
+            Some(a) => Ok(AudioBuffer::silence(sample_rate, (a.channels as usize).min(MAX_OFFLINE_CHANNELS), frames)),
+            None if stream == 0 => self.audio(start, frames, sample_rate),
+            None => Err(MediaError::NoStream("audio")),
+        }
+    }
+}
+
+/// Most channels an offline stream's silence carries (the count comes from the file's metadata).
+const MAX_OFFLINE_CHANNELS: usize = 64;
+
+#[cfg(test)]
+mod offline_source_tests {
+    use super::*;
+
+    fn stream(channels: u32) -> AudioStreamInfo {
+        AudioStreamInfo { sample_rate: 48_000, channels, codec: "pcm".into(), bits_per_sample: Some(16) }
+    }
+
+    fn offline(channels: &[u32]) -> OfflineSource {
+        let info = MediaInfo {
+            name: "gone.mov".into(),
+            kind: MediaKind::Movie,
+            duration: Tick::default(),
+            video: None,
+            audio_streams: channels.iter().map(|c| stream(*c)).collect(),
+            container: "mov".into(),
+            start_timecode: None,
+            file_size: None,
+        };
+        OfflineSource { info }
+    }
+
+    #[test]
+    fn a_secondary_stream_is_silence_with_that_streams_channels() {
+        let b = offline(&[2, 6]).audio_stream(1, 0, 480, 48_000).unwrap();
+        assert_eq!((b.channels.len(), b.frames()), (6, 480));
+        assert!(b.channels.iter().flatten().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn stream_zero_keeps_its_own_channel_count() {
+        assert_eq!(offline(&[1, 6]).audio_stream(0, 0, 8, 48_000).unwrap().channels.len(), 1);
+    }
+
+    #[test]
+    fn an_offline_source_without_audio_streams_still_answers_stream_zero_as_stereo() {
+        assert_eq!(offline(&[]).audio_stream(0, 0, 8, 48_000).unwrap().channels.len(), 2);
+    }
+
+    #[test]
+    fn an_index_past_the_listed_streams_is_an_error() {
+        assert!(matches!(offline(&[2, 6]).audio_stream(2, 0, 8, 48_000), Err(MediaError::NoStream("audio"))));
+        assert!(matches!(offline(&[]).audio_stream(1, 0, 8, 48_000), Err(MediaError::NoStream("audio"))));
+    }
+
+    #[test]
+    fn a_hostile_channel_count_is_bounded() {
+        let b = offline(&[2, u32::MAX]).audio_stream(1, 0, 4, 48_000).unwrap();
+        assert_eq!(b.channels.len(), MAX_OFFLINE_CHANNELS);
+    }
 }
