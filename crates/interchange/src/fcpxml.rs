@@ -57,14 +57,16 @@ pub(crate) fn parse_time(s: &str) -> Option<Tick> {
         if b == 0 {
             return None;
         }
-        let n = a * TICKS_PER_SECOND as i128;
+        // Attribute values are untrusted: every step checks for overflow.
+        let n = a.checked_mul(TICKS_PER_SECOND as i128)?;
         // Exact for every broadcast rate; round to the nearest tick otherwise.
         let q = n.div_euclid(b);
         let r = n.rem_euclid(b);
-        return Some(Tick((if 2 * r >= b.abs() { q + 1 } else { q }) as i64));
+        let q = if r.checked_mul(2)? >= b.checked_abs()? { q.checked_add(1)? } else { q };
+        return i64::try_from(q).ok().map(Tick);
     }
     if let Ok(i) = s.parse::<i64>() {
-        return Some(Tick(i * TICKS_PER_SECOND));
+        return i.checked_mul(TICKS_PER_SECOND).map(Tick);
     }
     s.parse::<f64>().ok().map(Tick::from_seconds_f64)
 }
@@ -1174,6 +1176,16 @@ fn marker_xml(m: &Marker, local: Tick, rate: FrameRate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Oversized attribute values used to overflow (a panic in debug, a wrong time in release).
+    #[test]
+    fn out_of_range_times_are_rejected_not_wrapped() {
+        assert_eq!(parse_time("99999999999999s"), None);
+        assert_eq!(parse_time("170141183460469231731687303715884105727/1s"), None);
+        assert_eq!(parse_time("9223372036854775807/1s"), None);
+        assert_eq!(parse_time("1/170141183460469231731687303715884105727s"), Some(Tick::ZERO));
+        assert_eq!(parse_time("5s"), Some(Tick(5 * TICKS_PER_SECOND)));
+    }
 
     #[test]
     fn rational_times_are_exact() {

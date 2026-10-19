@@ -313,14 +313,19 @@ impl<'a> Container<'a> {
     pub fn value(&self, p: &Prop) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         for s in &p.segs {
-            match s {
-                Seg::Imm(b) => out.extend_from_slice(b),
+            // Many segments may each cover the whole file; a value cannot be larger than the
+            // file that holds it, so cap the total before copying (not after).
+            let chunk = match s {
+                Seg::Imm(b) => b.as_slice(),
                 Seg::At(off, len) => {
                     let start = usize::try_from(*off).map_err(|_| "value offset too large")?;
-                    let b = self.data.get(start..start.checked_add(*len as usize).ok_or("bad value length")?).ok_or("a value lies outside the file")?;
-                    out.extend_from_slice(b);
+                    self.data.get(start..start.checked_add(*len as usize).ok_or("bad value length")?).ok_or("a value lies outside the file")?
                 }
+            };
+            if out.len().saturating_add(chunk.len()) > self.data.len() {
+                return Err("a value is larger than the file".into());
             }
+            out.extend_from_slice(chunk);
         }
         Ok(out)
     }
@@ -353,5 +358,31 @@ impl<'a> Container<'a> {
             }
         }
         key
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+
+    fn container(data: &[u8]) -> Container<'_> {
+        Container { data, objects: BTreeMap::new(), names: HashMap::new(), by_name: HashMap::new() }
+    }
+
+    #[test]
+    fn a_value_is_the_concatenation_of_its_segments() {
+        let c = container(b"abcdef");
+        let p = Prop { prop: 1, ty: 1, segs: vec![Seg::At(1, 2), Seg::Imm(vec![b'!'])] };
+        assert_eq!(c.value(&p).unwrap(), b"bc!");
+    }
+
+    /// A million segments that each cover the whole file used to be copied into one allocation.
+    #[test]
+    fn segments_that_add_up_to_more_than_the_file_are_refused() {
+        let c = container(&[7u8; 64]);
+        let p = Prop { prop: 1, ty: 1, segs: vec![Seg::At(0, 64); 1 << 20] };
+        assert!(c.value(&p).is_err());
+        let imm = Prop { prop: 1, ty: 1, segs: vec![Seg::Imm(vec![0; 65])] };
+        assert!(c.value(&imm).is_err());
     }
 }

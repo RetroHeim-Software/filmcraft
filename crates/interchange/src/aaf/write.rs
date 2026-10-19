@@ -630,6 +630,30 @@ fn transition_op(kind: CKind, effect: &str) -> Auid {
     }
 }
 
+/// `BlockAlign` and `AverageBPS` of a PCM descriptor. The inputs can come from a parsed file,
+/// so the products saturate instead of overflowing (a panic in debug, a wrong value in release).
+fn pcm_rates(channels: u32, bits: u32, sample_rate: u32) -> (u16, u32) {
+    let block = channels.max(1).saturating_mul(bits.div_ceil(8));
+    (u16::try_from(block).unwrap_or(u16::MAX), block.saturating_mul(sample_rate))
+}
+
+#[cfg(test)]
+mod pcm_rates_tests {
+    use super::pcm_rates;
+
+    #[test]
+    fn ordinary_stereo_24_bit() {
+        assert_eq!(pcm_rates(2, 24, 48_000), (6, 288_000));
+        assert_eq!(pcm_rates(0, 16, 44_100), (2, 88_200));
+    }
+
+    #[test]
+    fn hostile_values_saturate() {
+        assert_eq!(pcm_rates(u32::MAX, 64, u32::MAX), (u16::MAX, u32::MAX));
+        assert_eq!(pcm_rates(2000, 512, 48_000).0, u16::MAX);
+    }
+}
+
 fn descriptor(w: &mut W, s: &Source) -> Obj {
     let rate = source_rate(s);
     let len = w.u(s.length, rate);
@@ -650,14 +674,14 @@ fn descriptor(w: &mut W, s: &Source) -> Obj {
             .data_prop(pid::COMPONENT_WIDTH, 8u32.to_le_bytes().to_vec())
             .data_prop(pid::HORIZONTAL_SUBSAMPLING, 2u32.to_le_bytes().to_vec()),
         CKind::Sound => {
-            let block = s.file_channels.max(1) * (s.bits as u32).div_ceil(8);
+            let (block_align, average_bps) = pcm_rates(s.file_channels, s.bits as u32, s.sample_rate);
             Obj::new(cls::PCM_DESCRIPTOR)
                 .data_prop(pid::AUDIO_SAMPLING_RATE, rational(s.sample_rate as i64, 1))
                 .data_prop(pid::LOCKED, vec![1])
                 .data_prop(pid::CHANNELS, s.file_channels.max(1).to_le_bytes().to_vec())
                 .data_prop(pid::QUANTIZATION_BITS, (s.bits as u32).to_le_bytes().to_vec())
-                .data_prop(pid::BLOCK_ALIGN, (block as u16).to_le_bytes().to_vec())
-                .data_prop(pid::AVERAGE_BPS, (block * s.sample_rate).to_le_bytes().to_vec())
+                .data_prop(pid::BLOCK_ALIGN, block_align.to_le_bytes().to_vec())
+                .data_prop(pid::AVERAGE_BPS, average_bps.to_le_bytes().to_vec())
         }
     };
     d.set(pid::SAMPLE_RATE, Value::Data(rational(rate.0, rate.1)));

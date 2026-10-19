@@ -65,7 +65,8 @@ pub fn file_url_to_path(url: &str) -> String {
         return url.to_string();
     }
     let rest = &url[7..];
-    let rest = if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("localhost") { &rest[9..] } else { rest };
+    // `get`, not a slice: byte 9 may fall inside a multi-byte character of a hostile host name.
+    let rest = if rest.get(..9).is_some_and(|h| h.eq_ignore_ascii_case("localhost")) { &rest[9..] } else { rest };
     let decoded = percent_decode(rest);
     // file:///C:/x -> C:/x
     if decoded.len() >= 3 && decoded.starts_with('/') && is_windows_abs(&decoded[1..]) {
@@ -676,6 +677,13 @@ pub(crate) fn sanitize_reel(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte 9 of the part after `file://` fell inside a two-byte character and the slice panicked.
+    #[test]
+    fn a_non_ascii_host_is_not_sliced_mid_character() {
+        assert_eq!(file_url_to_path("file://\u{e9}\u{e9}\u{e9}\u{e9}/clip.mov"), "//\u{e9}\u{e9}\u{e9}\u{e9}/clip.mov");
+        assert_eq!(file_url_to_path("file://abcdefgh\u{e9}/x"), "//abcdefgh\u{e9}/x");
+    }
 
     #[test]
     fn urls() {

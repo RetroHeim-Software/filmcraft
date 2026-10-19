@@ -223,6 +223,47 @@ fn bad(s: impl Into<String>) -> String {
     s.into()
 }
 
+/// The `count` keys of `size` bytes each that follow the 9-byte header of a weak collection
+/// index. The index comes from an untrusted file: a zero key size would make every slice
+/// "fit", so a huge `count` would allocate without bound; instead the whole key table must lie
+/// inside the index before anything is allocated.
+fn weak_keys(idx: &[u8], count: usize, size: usize) -> Result<Vec<Vec<u8>>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if size == 0 {
+        return Err(bad("weak collection index with a zero key size"));
+    }
+    let end = count.checked_mul(size).and_then(|n| n.checked_add(9)).ok_or_else(|| bad("weak collection index too large"))?;
+    let table = idx.get(9..end).ok_or_else(|| bad("short weak collection index"))?;
+    Ok(table.chunks_exact(size).map(<[u8]>::to_vec).collect())
+}
+
+#[cfg(test)]
+mod weak_keys_tests {
+    use super::weak_keys;
+
+    #[test]
+    fn reads_the_keys_after_the_header() {
+        let mut idx = vec![0u8; 9];
+        idx.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(weak_keys(&idx, 2, 2).unwrap(), vec![vec![1, 2], vec![3, 4]]);
+        assert!(weak_keys(&idx, 0, 0).unwrap().is_empty());
+    }
+
+    /// A zero key size with a huge count used to push billions of empty keys.
+    #[test]
+    fn a_zero_key_size_with_a_count_is_refused() {
+        assert!(weak_keys(&[0u8; 9], u32::MAX as usize, 0).is_err());
+    }
+
+    #[test]
+    fn a_table_longer_than_the_index_is_refused_before_allocating() {
+        assert!(weak_keys(&[0u8; 12], u32::MAX as usize, 255).is_err());
+        assert!(weak_keys(&[0u8; 12], usize::MAX, 255).is_err());
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Writing
 // ---------------------------------------------------------------------------------------------
@@ -479,11 +520,7 @@ impl R<'_> {
                     let (Some(count), Some(tag), Some(key_pid), Some(&size)) = (rd_u32(&idx, 0), rd_u16(&idx, 4), rd_u16(&idx, 6), idx.get(8)) else {
                         return Err(bad("short weak collection index"));
                     };
-                    let size = size as usize;
-                    let mut keys = Vec::new();
-                    for k in 0..count as usize {
-                        keys.push(idx.get(9 + k * size..9 + (k + 1) * size).ok_or_else(|| bad("short weak collection index"))?.to_vec());
-                    }
+                    let keys = weak_keys(&idx, count as usize, size as usize)?;
                     Value::WeakVec(self.paths.get(tag as usize).cloned().unwrap_or_default(), key_pid, keys)
                 }
                 SF_DATA_STREAM => {

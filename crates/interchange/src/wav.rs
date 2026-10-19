@@ -13,7 +13,8 @@ pub fn wav_file(pcm: &[u8], channels: u16, sample_rate: u32, bits: u16) -> Vec<u
 
 /// The RIFF header of a WAVE file up to and including the `data` chunk header.
 pub fn wav_header(data_len: u32, channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
-    let block = channels.max(1) * bits.div_ceil(8);
+    // Widened first: the product of a hostile channel count and bit depth overflows `u16`.
+    let block = u32::from(channels.max(1)).saturating_mul(u32::from(bits.div_ceil(8)));
     let mut v = Vec::with_capacity(44);
     v.extend_from_slice(b"RIFF");
     // Saturating: a huge source (data_len saturated by the caller) must not overflow.
@@ -23,8 +24,8 @@ pub fn wav_header(data_len: u32, channels: u16, sample_rate: u32, bits: u16) -> 
     v.extend_from_slice(&1u16.to_le_bytes());
     v.extend_from_slice(&channels.max(1).to_le_bytes());
     v.extend_from_slice(&sample_rate.to_le_bytes());
-    v.extend_from_slice(&sample_rate.saturating_mul(block as u32).to_le_bytes());
-    v.extend_from_slice(&block.to_le_bytes());
+    v.extend_from_slice(&sample_rate.saturating_mul(block).to_le_bytes());
+    v.extend_from_slice(&u16::try_from(block).unwrap_or(u16::MAX).to_le_bytes());
     v.extend_from_slice(&bits.to_le_bytes());
     v.extend_from_slice(b"data");
     v.extend_from_slice(&data_len.to_le_bytes());
@@ -169,6 +170,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn hostile_channel_counts_saturate_in_the_header() {
+        let h = wav_header(0, 2000, 48_000, 512);
+        assert_eq!(&h[32..34], &u16::MAX.to_le_bytes(), "BlockAlign");
+        assert_eq!(&h[28..32], &u32::MAX.to_le_bytes(), "ByteRate");
+        let ok = wav_header(0, 2, 48_000, 24);
+        assert_eq!(&ok[32..34], &6u16.to_le_bytes());
+        assert_eq!(&ok[28..32], &288_000u32.to_le_bytes());
+    }
 
     #[test]
     fn wav_and_aiff_round_trip() {
