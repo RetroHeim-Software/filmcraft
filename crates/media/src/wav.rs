@@ -73,7 +73,9 @@ impl WavSource {
         let (tag, ch, rate, bits) = fmt.ok_or_else(|| MediaError::Decode(format!("{name}: missing fmt chunk")))?;
         let (off, len) = data.ok_or_else(|| MediaError::Decode(format!("{name}: missing data chunk")))?;
         let float = tag == 3;
-        if !(tag == 1 || float) || ch == 0 || !matches!(bits, 8 | 16 | 24 | 32 | 64) {
+        // Only the combinations `sample` can decode: 32/64-bit float, 8/16/24/32-bit integer PCM.
+        let bits_ok = if float { matches!(bits, 32 | 64) } else { matches!(bits, 8 | 16 | 24 | 32) };
+        if !(tag == 1 || float) || ch == 0 || rate == 0 || !bits_ok {
             return Err(MediaError::Unsupported(format!("{name}: WAV format tag {tag}, {bits} bits")));
         }
         let frame_bytes = ch as usize * bits as usize / 8;
@@ -208,6 +210,32 @@ mod tests {
         assert_eq!(src.info().duration, Tick::from_units(100, 48000));
         assert_eq!(src.time_reference(), None);
         assert_eq!(src.info().start_timecode, None);
+    }
+
+    /// A zero sample rate gave a zero duration and a zero resampling ratio that re-read frame 0.
+    #[test]
+    fn a_zero_sample_rate_is_rejected() {
+        let mut wav = write_wav16(&[0.0; 8], 1, 48_000);
+        assert_eq!(&wav[24..28], &48_000u32.to_le_bytes());
+        wav[24..28].copy_from_slice(&0u32.to_le_bytes());
+        assert!(WavSource::parse("zero.wav", wav.into()).is_err());
+    }
+
+    /// A bit depth `sample` cannot decode for the format would parse fine and play as silence.
+    #[test]
+    fn a_bit_depth_with_no_decoder_for_the_format_is_rejected() {
+        for (tag, bits) in [(3u16, 8u16), (3, 16), (3, 24), (1, 64)] {
+            let mut wav = write_wav16(&[0.0; 8], 1, 48_000);
+            wav[20..22].copy_from_slice(&tag.to_le_bytes());
+            wav[34..36].copy_from_slice(&bits.to_le_bytes());
+            assert!(WavSource::parse("bad.wav", wav.into()).is_err(), "tag {tag} bits {bits}");
+        }
+        for (tag, bits) in [(3u16, 32u16), (1, 16)] {
+            let mut wav = write_wav16(&[0.0; 8], 1, 48_000);
+            wav[20..22].copy_from_slice(&tag.to_le_bytes());
+            wav[34..36].copy_from_slice(&bits.to_le_bytes());
+            assert!(WavSource::parse("ok.wav", wav.into()).is_ok(), "tag {tag} bits {bits}");
+        }
     }
 
     /// Insert a chunk before `data`.

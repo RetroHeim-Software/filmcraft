@@ -52,13 +52,36 @@ pub fn background() -> bool {
     BACKGROUND.with(Cell::get)
 }
 
-/// Run `f` with the draft-decoding hint `on` (restoring the previous one after). Frames decoded
-/// in draft mode are only handed to requests made in draft mode.
+/// Restores a thread-local `Cell` hint when dropped, so the previous value comes back even when
+/// the scoped closure panics: a leaked `DRAFT = true` on a reused worker thread would otherwise
+/// make a later export decode in draft quality.
+struct RestoreCell<T: Copy + 'static> {
+    key: &'static std::thread::LocalKey<Cell<T>>,
+    prev: T,
+}
+
+impl<T: Copy + 'static> Drop for RestoreCell<T> {
+    fn drop(&mut self) {
+        // `try_with`: during thread teardown the key may already be gone.
+        let _ = self.key.try_with(|c| c.set(self.prev));
+    }
+}
+
+/// Restores the thread's cancellation flag when dropped (also while unwinding).
+struct RestoreCancel(Option<Arc<AtomicBool>>);
+
+impl Drop for RestoreCancel {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        let _ = CURRENT.try_with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Run `f` with the draft-decoding hint `on` (restoring the previous one after, even if `f`
+/// panics). Frames decoded in draft mode are only handed to requests made in draft mode.
 pub fn with_draft<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let prev = DRAFT.with(|c| c.replace(on));
-    let r = f();
-    DRAFT.with(|c| c.set(prev));
-    r
+    let _restore = RestoreCell { key: &DRAFT, prev: DRAFT.with(|c| c.replace(on)) };
+    f()
 }
 
 /// Whether the work running on this thread accepts draft-quality decoding (off unless inside
@@ -67,15 +90,13 @@ pub fn draft() -> bool {
     DRAFT.with(Cell::get)
 }
 
-/// Run `f` with the catch-up hint `margin` (restoring the previous one after): frames shown more
+/// Run `f` with the catch-up hint `margin` (restoring the previous one after, even if `f` panics): frames shown more
 /// than `margin` before the requested time are late (`Some(Tick::ZERO)`: everything before it).
 /// The margin is measured in media time at normal speed; a wrong guess (a sped-up or reversed
 /// clip) only costs a later re-seek, never a wrong frame.
 pub fn with_catch_up<R>(margin: Option<Tick>, f: impl FnOnce() -> R) -> R {
-    let prev = CATCH_UP.with(|c| c.replace(margin));
-    let r = f();
-    CATCH_UP.with(|c| c.set(prev));
-    r
+    let _restore = RestoreCell { key: &CATCH_UP, prev: CATCH_UP.with(|c| c.replace(margin)) };
+    f()
 }
 
 /// The catch-up margin of the work running on this thread (None: no frame is late).
@@ -83,12 +104,11 @@ pub fn catch_up() -> Option<Tick> {
     CATCH_UP.with(Cell::get)
 }
 
-/// Run `f` with `flag` as this thread's cancellation flag (restoring the previous one after).
+/// Run `f` with `flag` as this thread's cancellation flag (restoring the previous one after,
+/// even if `f` panics).
 pub fn with_cancel<R>(flag: &Arc<AtomicBool>, f: impl FnOnce() -> R) -> R {
-    let prev = CURRENT.with(|c| c.replace(Some(flag.clone())));
-    let r = f();
-    CURRENT.with(|c| *c.borrow_mut() = prev);
-    r
+    let _restore = RestoreCancel(CURRENT.with(|c| c.replace(Some(flag.clone()))));
+    f()
 }
 
 /// Whether the work running on this thread has been cancelled.
@@ -109,6 +129,23 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
             assert!(cancelled());
         });
+        assert!(!cancelled());
+    }
+
+    #[test]
+    fn a_panic_inside_a_scope_does_not_leak_the_hints_to_the_next_job() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let flag = Arc::new(AtomicBool::new(true));
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            with_draft(true, || {
+                with_catch_up(Some(Tick(9)), || {
+                    with_cancel(&flag, || panic!("decoder blew up"));
+                })
+            })
+        }));
+        assert!(outcome.is_err());
+        assert!(!draft());
+        assert_eq!(catch_up(), None);
         assert!(!cancelled());
     }
 
