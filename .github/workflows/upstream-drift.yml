@@ -1,0 +1,65 @@
+# Weekly: how far is retroheim/base behind public upstream, does retroheim/main still rebase
+# onto it, do the eight carried crates still pass there. Never pushes. Opens or updates one
+# issue titled "Upstream drift" while the base is behind, there is a conflict or a test is red,
+# and closes it once the base is level with upstream. This file must live on the repository's default branch (retroheim/main).
+name: upstream-drift
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false # the job has no need to push, and cannot
+
+      - name: Add public upstream as a remote
+        run: git remote add upstream https://github.com/storytold/filmcraft.git
+
+      - name: Check drift (fetch, rebase in a scratch worktree, test)
+        id: drift
+        run: |
+          set +e
+          DRIFT_REPORT="$RUNNER_TEMP/drift.md" scripts/check-upstream-drift.sh
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open, update or close the "Upstream drift" issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.drift.outputs.status }}
+        run: |
+          set -eu
+          title="Upstream drift"
+          number=$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          case "$STATUS" in
+            0)
+              if [ -n "$number" ]; then
+                gh issue close "$number" --comment "Level with upstream on $(date -u +%F).$(printf '\n\n')$(cat "$RUNNER_TEMP/drift.md")"
+              fi
+              ;;
+            *)
+              [ -f "$RUNNER_TEMP/drift.md" ] || printf '## Upstream drift\n\nThe check could not run (status %s). See the workflow log.\n' "$STATUS" > "$RUNNER_TEMP/drift.md"
+              if [ -n "$number" ]; then
+                gh issue edit "$number" --body-file "$RUNNER_TEMP/drift.md"
+              else
+                gh issue create --title "$title" --body-file "$RUNNER_TEMP/drift.md"
+              fi
+              exit 1
+              ;;
+          esac
