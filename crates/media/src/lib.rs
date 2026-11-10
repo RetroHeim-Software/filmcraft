@@ -9,14 +9,17 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod animated;
 pub mod cache;
 pub mod cancel;
 pub mod digits;
+pub mod dpx;
 pub mod generators;
 pub mod pending;
 pub mod reader;
 pub mod sequence;
 pub mod still;
+pub mod tga;
 pub mod wav;
 
 use std::path::Path;
@@ -50,6 +53,59 @@ pub enum MediaError {
 
 pub type Result<T> = std::result::Result<T, MediaError>;
 
+/// Up to 384 kHz audio (surpassing professional 192 kHz formats).
+pub const MAX_AUDIO_SAMPLE_RATE: u32 = 384_000;
+/// Up to 64 discrete channels (exceeding standard 32-channel immersive layouts).
+pub const MAX_AUDIO_CHANNELS: u32 = 64;
+/// Bounded planar audio buffer: 64 channels * 192 kHz * 10 seconds of f32 is ~492 MiB.
+pub const MAX_AUDIO_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+
+/// Bound container-advertised audio stream dimensions before they are trusted by the app or
+/// allocator.
+///
+/// Out-of-range values are rejected rather than clamped: publishing a lower sample rate without
+/// resampling the samples would make the stream play at the wrong speed, and a clamped channel
+/// count would misdescribe the interleaving.
+pub fn bounded_audio_dimensions(sample_rate: u32, channels: u32) -> Result<(u32, u32)> {
+    if sample_rate == 0 || sample_rate > MAX_AUDIO_SAMPLE_RATE {
+        return Err(MediaError::Decode(format!("unsupported audio sample rate {sample_rate}")));
+    }
+    if channels == 0 || channels > MAX_AUDIO_CHANNELS {
+        return Err(MediaError::Decode(format!("unsupported audio channel count {channels}")));
+    }
+    Ok((sample_rate, channels))
+}
+
+/// Check an adapter-owned planar `f32` audio allocation before constructing it.
+pub fn validate_audio_buffer_shape(channels: usize, frames: usize) -> Result<()> {
+    if channels == 0 || channels > MAX_AUDIO_CHANNELS as usize {
+        return Err(MediaError::Decode(format!("unsupported audio channel count {channels}")));
+    }
+    let bytes = channels
+        .checked_mul(frames)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| MediaError::Decode("audio buffer dimensions overflow".into()))?;
+    if bytes > MAX_AUDIO_BUFFER_BYTES {
+        return Err(MediaError::Decode(format!("audio buffer of {bytes} bytes exceeds the {} byte limit", MAX_AUDIO_BUFFER_BYTES)));
+    }
+    Ok(())
+}
+
+/// Number of source frames needed to resample `frames` output frames. Arithmetic is checked so
+/// corrupted rates cannot wrap into a small allocation.
+pub fn resample_source_frames(frames: usize, source_rate: u32, output_rate: u32) -> Result<usize> {
+    if output_rate == 0 {
+        return Err(MediaError::Decode("zero requested audio sample rate".into()));
+    }
+    let source = usize::try_from(source_rate).map_err(|_| MediaError::Decode("invalid source sample rate".into()))?;
+    let output = usize::try_from(output_rate).map_err(|_| MediaError::Decode("invalid output sample rate".into()))?;
+    frames
+        .checked_mul(source)
+        .and_then(|n| n.checked_add(output.saturating_sub(1)))
+        .map(|n| n / output)
+        .ok_or_else(|| MediaError::Decode("resampled audio window overflows".into()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaKind {
     /// Video, possibly with audio.
@@ -75,6 +131,11 @@ pub struct VideoStreamInfo {
     /// HDR static metadata (mastering display, content light level) when the file carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr: Option<filmcraft_color::HdrMetadata>,
+    /// Which values of `color` are FilmCraft's defaults rather than read from the file. `None`
+    /// where the source doesn't say: stills, generated media, MPEG program and transport streams,
+    /// and media info saved before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_assumed: Option<filmcraft_color::ColorAssumed>,
 }
 
 /// Most audio streams a source reports (the count comes from the file: never trusted).
@@ -156,6 +217,12 @@ pub trait MediaSource: Send + Sync {
     fn info(&self) -> &MediaInfo;
     /// The frame displayed at media time `req.time`.
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
+    /// Like [`video_frame`](Self::video_frame), but a source may leave the container's display
+    /// rotation to the caller: the frame comes with the clockwise quarter turns still to apply
+    /// to it (0: upright, as `video_frame` returns it).
+    fn video_frame_unturned(&self, req: FrameRequest) -> Result<(Arc<VideoFrame>, u8)> {
+        self.video_frame(req).map(|f| (f, 0))
+    }
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer>;
     /// Like [`audio`](Self::audio) for audio stream `stream` (an index into
@@ -169,7 +236,7 @@ pub trait MediaSource: Send + Sync {
 pub type SharedSource = Arc<dyn MediaSource>;
 
 /// File extensions we recognise at import (the media browser filters on these).
-pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp"];
+pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "tga", "dpx", "exr", "hdr", "dng", "psd"];
 pub const AUDIO_EXTENSIONS: &[&str] = &["wav", "wave", "bwf", "aif", "aiff", "mp3", "mp2", "m4a", "aac", "flac", "ogg", "opus"];
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "mxf", "mts", "m2ts", "m2t", "ts", "mpg", "mpeg", "vob", "mod", "tod", "m2v", "m1v", "mpv", "3gp", "y4m", "apv",
@@ -183,17 +250,28 @@ pub fn is_importable(path: &Path) -> bool {
 /// A pluggable opener (containers/codecs register themselves here from higher-level crates).
 pub type Opener = fn(name: &str, bytes: Arc<[u8]>) -> Option<Result<SharedSource>>;
 
-/// Open media from bytes, trying `extra` openers first, then the built-in ones (stills, WAV).
+/// Open media from bytes, trying `extra` openers first, then the built-in ones (WAV, animated
+/// images, stills).
 pub fn open_bytes(name: &str, bytes: Arc<[u8]>, extra: &[Opener]) -> Result<SharedSource> {
     for o in extra {
         if let Some(r) = o(name, bytes.clone()) {
             return r;
         }
     }
+    if still::exr::sniff(&bytes) {
+        return Ok(Arc::new(still::exr::still(name, &bytes)?));
+    }
+    if still::hdr::sniff(&bytes) {
+        return Ok(Arc::new(still::hdr::still(name, &bytes)?));
+    }
     if wav::sniff(&bytes) {
         return Ok(Arc::new(wav::WavSource::parse(name, bytes)?));
     }
-    if still::sniff(&bytes) {
+    // APNG, animated GIF, and animated WebP play as movies (#402); single-frame files fall through to the stills
+    if let Some(r) = animated::open(name, &bytes) {
+        return Ok(Arc::new(r?));
+    }
+    if still::sniff(name, &bytes) {
         return Ok(Arc::new(still::StillSource::decode(name, &bytes)?));
     }
     Err(MediaError::Unsupported(format!("{name}: unrecognised format")))
@@ -227,15 +305,65 @@ impl MediaSource for OfflineSource {
         Ok(Arc::new(VideoFrame::rgba8(w, h, px).with_pts(req.time)))
     }
     fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
-        Ok(AudioBuffer::silence(sample_rate, self.info.audio().map_or(2, |a| a.channels as usize), frames))
+        // the shape comes from the project's stored metadata (the media is not there to check)
+        let channels = self.info.audio().map_or(2, |a| a.channels as usize);
+        validate_audio_buffer_shape(channels, frames)?;
+        Ok(AudioBuffer::silence(sample_rate, channels, frames))
     }
     fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
         match self.info.audio_streams.get(stream) {
-            // The channel count comes from the (untrusted) file metadata: bound it like the stream count.
-            Some(a) => Ok(AudioBuffer::silence(sample_rate, (a.channels as usize).min(MAX_OFFLINE_CHANNELS), frames)),
+            Some(a) => {
+                let channels = (a.channels as usize).min(MAX_OFFLINE_CHANNELS);
+                validate_audio_buffer_shape(channels, frames)?;
+                Ok(AudioBuffer::silence(sample_rate, channels, frames))
+            }
             None if stream == 0 => self.audio(start, frames, sample_rate),
             None => Err(MediaError::NoStream("audio")),
         }
+    }
+}
+
+#[cfg(test)]
+mod importable_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn camera_extensions_match_regardless_of_case() {
+        for name in ["clip.mov", "clip.MOV", "clip.Mov", "shot.MP4", "IMG_0001.JPG", "sound.WAV", "take.M2TS"] {
+            assert!(is_importable(Path::new(name)), "{name}");
+        }
+        assert!(!is_importable(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn offline_media_does_not_allocate_from_stored_metadata() {
+        let info = MediaInfo {
+            name: "gone.wav".into(),
+            kind: MediaKind::AudioOnly,
+            duration: Tick(0),
+            video: None,
+            audio_streams: vec![AudioStreamInfo { sample_rate: 48_000, channels: 60_000, codec: "pcm".into(), bits_per_sample: None }],
+            container: String::new(),
+            start_timecode: None,
+            file_size: None,
+        };
+        let src = OfflineSource { info };
+        // a 100-day transcription request at the stored channel count
+        // computed as u64: the product overflows a 32-bit usize (x86 Windows), where it must still be rejected
+        let frames = usize::try_from(48_000u64 * 86_400 * 100).unwrap_or(usize::MAX);
+        assert!(src.audio(0, frames, 48_000).is_err());
+    }
+
+    #[test]
+    fn hostile_audio_dimensions_are_bounded_before_adapters_allocate() {
+        assert!(bounded_audio_dimensions(0, 0).is_err());
+        assert!(bounded_audio_dimensions(u32::MAX, u32::MAX).is_err());
+        assert!(bounded_audio_dimensions(MAX_AUDIO_SAMPLE_RATE + 1, 2).is_err());
+        assert_eq!(bounded_audio_dimensions(48_000, 2).ok(), Some((48_000, 2)));
+        assert!(validate_audio_buffer_shape(MAX_AUDIO_CHANNELS as usize, MAX_AUDIO_BUFFER_BYTES / 4 / MAX_AUDIO_CHANNELS as usize).is_ok());
+        assert!(validate_audio_buffer_shape(MAX_AUDIO_CHANNELS as usize, MAX_AUDIO_BUFFER_BYTES / 4 / MAX_AUDIO_CHANNELS as usize + 1).is_err());
+        assert!(resample_source_frames(usize::MAX, MAX_AUDIO_SAMPLE_RATE, 1).is_err());
     }
 }
 
@@ -291,5 +419,10 @@ mod offline_source_tests {
     fn a_hostile_channel_count_is_bounded() {
         let b = offline(&[2, u32::MAX]).audio_stream(1, 0, 4, 48_000).unwrap();
         assert_eq!(b.channels.len(), MAX_OFFLINE_CHANNELS);
+    }
+
+    #[test]
+    fn oversized_secondary_stream_requests_are_rejected() {
+        assert!(offline(&[2, 6]).audio_stream(1, 0, usize::MAX, 48_000).is_err());
     }
 }

@@ -9,8 +9,10 @@
 //!
 //! - **Apply a cut at each detected cut point**: the clip (and its linked audio) is cut at the
 //!   first frame of each new shot;
-//! - **Create a subclip for each cut**: one subclip per shot, in a new bin "<clip> Scenes";
-//! - **Generate clip markers**: a marker on the clip's master clip (media time) at each cut.
+//! - **Create a bin of subclips from each detected cut point**: one subclip per shot, in a new
+//!   bin "<clip> Scenes";
+//! - **Create a clip marker at each detected cut point**: a marker on the clip's master clip
+//!   (media time) at each cut.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +37,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         enabled: has_video_selection,
         run: detect,
         journal: true,
+        named: crate::commands::NamedKeys::NONE,
     }]
 }
 
@@ -284,6 +287,9 @@ fn apply_results(s: &mut Session, seq_id: ItemId, apply: SceneApply, results: Ve
                             continue;
                         }
                         m.markers.push(Marker {
+                            url: String::new(),
+                            author: String::new(),
+                            custom_color: None,
                             id: MarkerId(id),
                             start: *mt,
                             duration: Tick::ZERO,
@@ -318,5 +324,4 @@ fn apply_results(s: &mut Session, seq_id: ItemId, apply: SceneApply, results: Ve
 }
 
 #[cfg(test)]
-#[path = "scene_detect_tests.rs"]
 mod tests;

@@ -49,6 +49,10 @@ pub enum H264Profile {
     Main,
     #[default]
     High,
+    /// High 10: 10-bit 4:2:0 encoding. HDR exports keep their 10-bit precision; SDR exports are
+    /// rendered at 8 bits first, so this adds no banding of its own but cannot remove it.
+    #[serde(rename = "high10")]
+    High10,
 }
 
 impl H264Profile {
@@ -57,7 +61,13 @@ impl H264Profile {
             H264Profile::Baseline => "Baseline",
             H264Profile::Main => "Main",
             H264Profile::High => "High",
+            H264Profile::High10 => "High 10",
         }
+    }
+
+    /// Bits per sample of the coded pictures.
+    pub fn bit_depth(self) -> u8 {
+        if self == H264Profile::High10 { 10 } else { 8 }
     }
 }
 
@@ -102,6 +112,9 @@ pub enum BitrateMode {
     Vbr1Pass,
     /// Variable bitrate, two passes (the picture is rendered and analysed first).
     Vbr2Pass,
+    /// Constant quality: every frame is coded at [`ExportSettings::crf`] and the bitrate follows the
+    /// picture (H.264, built-in encoder only).
+    Crf,
 }
 
 impl BitrateMode {
@@ -110,6 +123,7 @@ impl BitrateMode {
             BitrateMode::Cbr => "CBR",
             BitrateMode::Vbr1Pass => "VBR, 1 pass",
             BitrateMode::Vbr2Pass => "VBR, 2 pass",
+            BitrateMode::Crf => "CRF (constant quality)",
         }
     }
 }
@@ -156,7 +170,51 @@ impl MxfVideoCodec {
     }
 }
 
-/// Audio codec. `Auto` = AAC in MP4, PCM in QuickTime / WAV / AIFF.
+/// Audio codec. `Auto` = AAC in MP4 and AAC Audio, PCM in QuickTime / WAV / AIFF; MP3 only in
+/// the MP3 format.
+/// Compression of OpenEXR stills (the file's `compression` attribute). Every mode is lossless.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExrCompression {
+    /// Uncompressed.
+    #[default]
+    None,
+    /// Run-length coded bytes (RLE_COMPRESSION), one scan line per chunk.
+    Rle,
+    /// zlib (deflate) per scan line (ZIPS_COMPRESSION).
+    Zips,
+    /// zlib (deflate) per block of 16 scan lines (ZIP_COMPRESSION).
+    Zip,
+}
+
+impl ExrCompression {
+    pub const ALL: [ExrCompression; 4] = [ExrCompression::None, ExrCompression::Rle, ExrCompression::Zips, ExrCompression::Zip];
+    pub fn label(self) -> &'static str {
+        match self {
+            ExrCompression::None => "None",
+            ExrCompression::Rle => "RLE",
+            ExrCompression::Zips => "ZIP (1 scan line)",
+            ExrCompression::Zip => "ZIP (16 scan lines)",
+        }
+    }
+    /// The value of the OpenEXR `compression` attribute.
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            ExrCompression::None => 0,
+            ExrCompression::Rle => 1,
+            ExrCompression::Zips => 2,
+            ExrCompression::Zip => 3,
+        }
+    }
+    /// Scan lines per chunk.
+    pub(crate) fn lines(self) -> usize {
+        if self == ExrCompression::Zip { 16 } else { 1 }
+    }
+}
+
+/// Audio codec. `Auto` = AAC in MP4 and AAC Audio, PCM in QuickTime / WAV / AIFF, FLAC in FLAC,
+/// MP3 in MP3.
+/// MP4 and QuickTime can also carry FLAC; MXF is always PCM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AudioCodec {
@@ -164,6 +222,9 @@ pub enum AudioCodec {
     Auto,
     Aac,
     Pcm,
+    Mp3,
+    /// Lossless compression (the FLAC format).
+    Flac,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -176,13 +237,96 @@ pub struct AudioSettings {
     pub channels: u32,
     /// AAC bitrate.
     pub bitrate_kbps: u32,
-    /// PCM sample size: 16 or 24.
+    /// PCM and FLAC sample size: 16, 24 or 32 (other values round down to one of them, 16 at least).
     pub bits: u16,
+    /// 32-bit floating-point PCM instead of integers (needs `bits` 32; WAV, AIFF and QuickTime).
+    pub float: bool,
+    /// FLAC compression level, 0 (fastest) to 8 (smallest). Every level is lossless.
+    pub flac_level: u8,
 }
 
 impl Default for AudioSettings {
     fn default() -> Self {
-        AudioSettings { codec: AudioCodec::Auto, sample_rate: None, channels: 2, bitrate_kbps: 320, bits: 16 }
+        AudioSettings { codec: AudioCodec::Auto, sample_rate: None, channels: 2, bitrate_kbps: 320, bits: 16, float: false, flac_level: 5 }
+    }
+}
+
+impl AudioSettings {
+    /// The sample format [`AudioSettings::bits`] and [`AudioSettings::float`] ask for.
+    pub fn sample_format(&self) -> SampleFormat {
+        match self.bits {
+            32.. if self.float => SampleFormat::Float32,
+            32.. => SampleFormat::Int32,
+            24.. => SampleFormat::Int24,
+            _ => SampleFormat::Int16,
+        }
+    }
+
+    /// Ask for `f` ([`AudioSettings::bits`] and [`AudioSettings::float`]).
+    pub fn set_sample_format(&mut self, f: SampleFormat) {
+        self.bits = f.bits();
+        self.float = f.is_float();
+    }
+}
+
+/// How PCM and FLAC audio stores its samples. The mix is 32-bit float: the integer formats
+/// clip it at full scale, 32-bit float keeps it as it is (peaks above 0 dBFS included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleFormat {
+    Int16,
+    Int24,
+    Int32,
+    Float32,
+}
+
+impl SampleFormat {
+    pub const ALL: [SampleFormat; 4] = [SampleFormat::Int16, SampleFormat::Int24, SampleFormat::Int32, SampleFormat::Float32];
+
+    pub fn bits(self) -> u16 {
+        match self {
+            SampleFormat::Int16 => 16,
+            SampleFormat::Int24 => 24,
+            SampleFormat::Int32 | SampleFormat::Float32 => 32,
+        }
+    }
+
+    /// Bytes per sample.
+    pub fn bytes(self) -> usize {
+        usize::from(self.bits() / 8)
+    }
+
+    pub fn is_float(self) -> bool {
+        self == SampleFormat::Float32
+    }
+
+    /// The name the Export settings show.
+    pub fn label(self) -> &'static str {
+        match self {
+            SampleFormat::Int16 => "16 bit",
+            SampleFormat::Int24 => "24 bit",
+            SampleFormat::Int32 => "32 bit",
+            SampleFormat::Float32 => "32 bit float",
+        }
+    }
+
+    /// One mix sample as a signed integer of this size, clipped at full scale (0 for
+    /// [`SampleFormat::Float32`], which is never quantised). Not-a-number becomes silence.
+    pub fn quantise(self, s: f32) -> i32 {
+        // f32 products for 16 and 24 bit (the bytes every earlier export wrote); f64 for 32 bit,
+        // whose full scale 2^31 - 1 f32 cannot hold. NaN casts to 0, the casts saturate.
+        let s = s.clamp(-1.0, 1.0);
+        match self {
+            SampleFormat::Int16 => (s * 32_767.0).round() as i32,
+            SampleFormat::Int24 => (s * 8_388_607.0).round() as i32,
+            SampleFormat::Int32 => (f64::from(s) * 2_147_483_647.0).round() as i32,
+            SampleFormat::Float32 => 0,
+        }
+    }
+
+    /// One mix sample as stored by [`SampleFormat::Float32`]: as it is, NaN as silence and
+    /// infinities as the largest finite values.
+    pub fn float(s: f32) -> f32 {
+        if s.is_nan() { 0.0 } else { s.clamp(f32::MIN, f32::MAX) }
     }
 }
 
@@ -374,9 +518,24 @@ impl ExportSettings {
         if self.format.is_mxf() { self.mxf_video_codec.encoder_format() } else { self.format }
     }
 
+    /// Whether the output can carry an alpha channel ([`ExportSettings::alpha`]): PNG, TIFF,
+    /// Targa and OpenEXR sequences, GIF (binary transparency), and ProRes 4444 / 4444 XQ movies.
+    pub fn supports_alpha(&self) -> bool {
+        match self.format {
+            Format::PngSequence | Format::TiffSequence | Format::TgaSequence | Format::ExrSequence | Format::Gif => true,
+            Format::ProRes => crate::prores_profile(&self.prores_profile).chroma() == filmcraft_prores::ChromaFormat::Yuv444,
+            _ => false,
+        }
+    }
+
+    /// Whether the exported frames keep their alpha channel instead of being flattened over black.
+    pub fn keeps_alpha(&self) -> bool {
+        self.alpha && self.supports_alpha()
+    }
+
     /// Whether the output is a numbered image sequence.
     pub fn is_image_sequence(&self) -> bool {
-        matches!(self.format, Format::PngSequence | Format::TiffSequence | Format::BmpSequence)
+        self.format.is_image_sequence()
     }
 
     /// Output size, rate, audio format and bitrate for a sequence of `seq_w`×`seq_h` at `seq_rate`.
@@ -406,25 +565,42 @@ impl ExportSettings {
             6.. => 6,
             _ => 2,
         };
-        Resolved {
-            width: w,
-            height: h,
-            rate,
-            sample_rate: self.audio.sample_rate.filter(|r| (8000..=192_000).contains(r)).unwrap_or(seq_sr),
-            channels,
-            target_kbps: target,
-            max_kbps: max,
-            keyint,
+        Resolved { width: w, height: h, rate, sample_rate: self.audio.sample_rate.unwrap_or(seq_sr), channels, target_kbps: target, max_kbps: max, keyint }
+    }
+
+    /// The sample rate, channel count and bit rate (kbit/s) of the MP3 stream these settings
+    /// make from a sequence at `seq_sr`: MP3 carries 16-48 kHz (other rates are resampled to the
+    /// nearest one above, 48 kHz above 48 kHz), mono or stereo (5.1 is folded to stereo), and the
+    /// Layer III bit rate nearest at or below the setting.
+    pub fn mp3_stream(&self, seq_sr: u32) -> (u32, u32, u32) {
+        let rate = filmcraft_mp3enc::nearest_sample_rate(self.audio.sample_rate.unwrap_or(seq_sr));
+        let channels = if self.audio.channels <= 1 { 1 } else { 2 };
+        let kbps = filmcraft_mp3enc::nearest_bitrate(rate, self.audio.bitrate_kbps).unwrap_or(128);
+        (rate, channels, kbps)
+    }
+
+    /// Whether the audio codec and container of this export store samples as `f`: PCM in WAV,
+    /// AIFF and QuickTime takes all four, MXF integers only; FLAC integers only; AAC and MP3 none.
+    pub fn supports_sample_format(&self, f: SampleFormat) -> bool {
+        match self.audio_codec() {
+            AudioCodec::Aac | AudioCodec::Mp3 => false,
+            AudioCodec::Flac => !f.is_float(),
+            AudioCodec::Pcm | AudioCodec::Auto => !(f.is_float() && self.format.is_mxf()),
         }
     }
 
     /// The audio codec actually used.
     pub fn audio_codec(&self) -> AudioCodec {
         match (self.format, self.audio.codec) {
+            (Format::Flac, _) => AudioCodec::Flac,
             (Format::Wav | Format::Aiff | Format::MxfOp1a | Format::MxfOpAtom, _) => AudioCodec::Pcm,
-            (f, _) if f.is_h26x() && self.multiplexer == Multiplexer::Mp4 => AudioCodec::Aac,
-            (_, AudioCodec::Auto) if self.format.is_h26x() => AudioCodec::Aac,
-            (_, AudioCodec::Auto) => AudioCodec::Pcm,
+            (Format::Aac, _) => AudioCodec::Aac,
+            (Format::Mp3, _) => AudioCodec::Mp3,
+            // MP4 and QuickTime both carry FLAC (`fLaC` + `dfLa`)
+            (_, AudioCodec::Flac) => AudioCodec::Flac,
+            (f, _) if f.is_mp4_with(self.multiplexer) => AudioCodec::Aac,
+            (_, AudioCodec::Auto | AudioCodec::Mp3) if self.format.is_mp4_video() => AudioCodec::Aac,
+            (_, AudioCodec::Auto | AudioCodec::Mp3) => AudioCodec::Pcm,
             (_, c) => c,
         }
     }
@@ -436,7 +612,7 @@ impl ExportSettings {
 
     /// Whether the format carries video.
     pub fn has_video(&self) -> bool {
-        !matches!(self.format, Format::Wav | Format::Aiff)
+        !self.format.is_audio_only()
     }
 
     /// File extension of the output.
@@ -451,7 +627,8 @@ impl ExportSettings {
         let fps = r.rate.num as f64 / r.rate.den as f64;
         let px = r.width as f64 * r.height as f64;
         let video_bps = match self.video_format() {
-            Format::H264 | Format::Hevc => r.target_kbps as f64 * 1000.0,
+            Format::Aac | Format::Mp3 => 0.0,
+            Format::H264 | Format::Hevc | Format::Av1 => r.target_kbps as f64 * 1000.0,
             Format::ProRes => crate::prores_profile(&self.prores_profile).nominal_mbps_1080p30() * 1e6 * px / (1920.0 * 1080.0) * fps / 29.97,
             Format::DnxHr => {
                 // nominal 1080p29.97 data rates of the DNxHR profiles (Mb/s)
@@ -472,16 +649,29 @@ impl ExportSettings {
                 };
                 px * fps * bpp
             }
-            Format::Mjpeg => px * 8.0 * (0.4 + self.quality as f64 / 100.0 * 2.0) * fps / 8.0,
-            Format::PngSequence => px * 4.0 * 0.45 * 8.0 * fps,
-            Format::TiffSequence | Format::BmpSequence => px * if self.format == Format::BmpSequence { 3.0 } else { 4.0 } * 8.0 * fps,
+            Format::Mjpeg | Format::JpegSequence => px * 8.0 * (0.4 + self.quality as f64 / 100.0 * 2.0) * fps / 8.0,
+            Format::PngSequence => px * if self.keeps_alpha() { 4.0 } else { 3.0 } * 0.45 * 8.0 * fps,
+            Format::BmpSequence => px * 3.0 * 8.0 * fps,
+            Format::TiffSequence => px * if self.keeps_alpha() { 4.0 } else { 3.0 } * 8.0 * fps,
+            Format::TgaSequence => px * if self.keeps_alpha() { 4.0 } else { 3.0 } * 8.0 * fps,
+            // 10-bit RGB in one 32-bit word per pixel
+            Format::DpxSequence => px * 4.0 * 8.0 * fps,
+            // two bytes per half-float channel; lossless compression roughly halves it
+            Format::ExrSequence => {
+                let k = if self.exr_compression == ExrCompression::None { 1.0 } else { 0.5 };
+                px * if self.keeps_alpha() { 8.0 } else { 6.0 } * 8.0 * fps * k
+            }
             Format::Gif => px * 0.6 * 8.0 * fps,
-            Format::Wav | Format::Aiff | Format::MxfOp1a | Format::MxfOpAtom => 0.0,
+            Format::Wav | Format::Aiff | Format::Flac | Format::MxfOp1a | Format::MxfOpAtom => 0.0,
         };
-        let audio_bps = if self.has_audio() || matches!(self.format, Format::Wav | Format::Aiff) {
+        let audio_bps = if self.has_audio() || self.format.is_audio_only() {
+            let pcm = r.sample_rate as f64 * r.channels as f64 * f64::from(self.audio.sample_format().bits());
             match self.audio_codec() {
                 AudioCodec::Aac => self.audio.bitrate_kbps as f64 * 1000.0,
-                _ => r.sample_rate as f64 * r.channels as f64 * if self.audio.bits >= 24 { 24.0 } else { 16.0 },
+                AudioCodec::Mp3 => self.mp3_stream(seq_sr).2 as f64 * 1000.0,
+                // typical of music and dialogue; noise compresses less, silence far more
+                AudioCodec::Flac => pcm * 0.6,
+                _ => pcm,
             }
         } else {
             0.0
@@ -513,21 +703,32 @@ impl ExportSettings {
             match self.video_format() {
                 Format::H264 => {
                     v += &format!(
-                        ", {} {}, {}",
+                        ", {}{} ({}-bit) {}, {}",
                         self.h264_profile.label(),
+                        if self.h264_intra_only { " Intra" } else { "" },
+                        self.h264_profile.bit_depth(),
                         self.h264_level.map(|l| format!("L{}.{}", l / 10, l % 10)).unwrap_or_else(|| "auto level".into()),
                         self.bitrate_mode.label()
                     );
+                    v += &match self.bitrate_mode {
+                        BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
+                        BitrateMode::Crf => format!(" {}", self.crf),
+                        _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
+                    };
+                    v += &if self.h264_intra_only { ", every frame a keyframe".to_string() } else { format!(", keyframe every {} frames", r.keyint) };
+                }
+                Format::Hevc => {
+                    // Main 10 only where a registered encoder writes HDR (NVENC); VideoToolbox is 8-bit
+                    let profile = if crate::hdr_available(Format::Hevc) { "HEVC Main / Main 10 for HDR" } else { "HEVC Main" };
+                    v += &format!(", {profile} (hardware encoder), {}", self.bitrate_mode.label());
                     v += &match self.bitrate_mode {
                         BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
                         _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
                     };
                     v += &format!(", keyframe every {} frames", r.keyint);
                 }
-                Format::Hevc => {
-                    // Main 10 only where a registered encoder writes HDR (NVENC); VideoToolbox is 8-bit
-                    let profile = if crate::hdr_available(Format::Hevc) { "HEVC Main / Main 10 for HDR" } else { "HEVC Main" };
-                    v += &format!(", {profile} (hardware encoder), {}", self.bitrate_mode.label());
+                Format::Av1 => {
+                    v += &format!(", AV1 Main (hardware encoder), {}", self.bitrate_mode.label());
                     v += &match self.bitrate_mode {
                         BitrateMode::Cbr => format!(", {}", mbps(r.target_kbps)),
                         _ => format!(", Target {}, Max {}", mbps(r.target_kbps), mbps(r.max_kbps)),
@@ -540,17 +741,27 @@ impl ExportSettings {
                         Profile::Proxy => ", ProRes 422 Proxy",
                         Profile::Lt => ", ProRes 422 LT",
                         Profile::Standard => ", ProRes 422",
-                        _ => ", ProRes 422 HQ",
+                        Profile::Hq => ", ProRes 422 HQ",
+                        Profile::P4444 => ", ProRes 4444",
+                        Profile::P4444Xq => ", ProRes 4444 XQ",
                     }
                 }
                 Format::DnxHr => v += &format!(", DNxHR {}", if self.dnx_profile.is_empty() { "HQ".into() } else { self.dnx_profile.to_ascii_uppercase() }),
                 Format::Apv => v += &format!(", {}", crate::apv_profile(&self.apv_profile).name()),
-                Format::Mjpeg => v += &format!(", quality {}", self.quality),
+                Format::Mjpeg | Format::JpegSequence => v += &format!(", quality {}", self.quality),
+                Format::DpxSequence => v += ", 10-bit RGB",
+                Format::ExrSequence => {
+                    v += ", 16-bit half float, linear";
+                    match self.exr_compression {
+                        ExrCompression::None => v += ", uncompressed",
+                        c => v += &format!(", {} compression", c.label()),
+                    }
+                }
                 _ => {}
             }
             v
         };
-        let audio = if self.has_audio() || matches!(self.format, Format::Wav | Format::Aiff) {
+        let audio = if self.has_audio() || self.format.is_audio_only() {
             let ch = match r.channels {
                 1 => "Mono",
                 6 => "5.1",
@@ -558,17 +769,27 @@ impl ExportSettings {
             };
             match self.audio_codec() {
                 AudioCodec::Aac => format!("AAC, {} kbps, {} Hz, {ch}", self.audio.bitrate_kbps, r.sample_rate),
-                _ => format!("Uncompressed {}-bit PCM, {} Hz, {ch}", if self.audio.bits >= 24 { 24 } else { 16 }, r.sample_rate),
+                AudioCodec::Mp3 => {
+                    let (rate, channels, kbps) = self.mp3_stream(seq_sr);
+                    format!("MP3, {kbps} kbps, {rate} Hz, {}", if channels == 1 { "Mono" } else { "Stereo" })
+                }
+                AudioCodec::Flac => {
+                    format!("FLAC (lossless) {}-bit, level {}, {} Hz, {ch}", self.audio.sample_format().bits(), self.audio.flac_level.min(8), r.sample_rate)
+                }
+                _ => {
+                    let f = self.audio.sample_format();
+                    format!("Uncompressed {}-bit{} PCM, {} Hz, {ch}", f.bits(), if f.is_float() { " float" } else { "" }, r.sample_rate)
+                }
             }
         } else {
             "No audio".to_string()
         };
         let container = match self.format {
             Format::H264 | Format::Hevc if self.multiplexer == Multiplexer::Mov => "QuickTime",
-            Format::H264 | Format::Hevc => "MP4",
+            Format::H264 | Format::Hevc | Format::Av1 => "MP4",
             Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg => "QuickTime",
             Format::MxfOp1a | Format::MxfOpAtom => self.mxf_video_codec.label(),
-            Format::PngSequence | Format::TiffSequence | Format::BmpSequence => "Image sequence",
+            f if f.is_image_sequence() => "Image sequence",
             _ => "",
         };
         let format = if container.is_empty() { self.format.label().to_string() } else { format!("{} ({container})", self.format.label()) };
