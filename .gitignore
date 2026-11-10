@@ -1,7 +1,9 @@
 *~
 plan/
 /target
+/crates/*/target/
 /dist
 /log
 .DS_Store
 .claude/worktrees/
+__pycache__/

@@ -2,7 +2,7 @@
 //! sorting, view presets, Freeform positions / stacks / arrangements (undoable, saved with the
 //! project) and bin renames.
 
-use filmcraft_project::{ItemId, ItemKind};
+use filmcraft_project::{BinEntry, ItemId, ItemKind};
 use serde_json::{Value, json};
 
 use crate::Session;
@@ -304,4 +304,114 @@ fn select_all_selects_every_project_item() {
     s.execute("edit.selectAll", json!({})).unwrap();
     assert!(!s.state.selection.is_empty());
     assert_eq!(s.state.project_selection, before);
+}
+
+#[test]
+fn select_all_in_a_bin_skips_closed_bins_and_other_bins() {
+    // #456: Cmd+A in the Project panel selected every item in the project, closed bins included
+    let mut s = demo();
+    let outer = s.execute("file.newBin", json!({"name": "Footage A"})).unwrap()["bin"].as_u64().unwrap();
+    let inner = s.execute("file.newBin", json!({"name": "Day 1", "parent": outer})).unwrap()["bin"].as_u64().unwrap();
+    let ids = media(&s);
+    assert!(ids.len() >= 2);
+    s.execute("project.moveToBin", json!({"items": [ids[0].0], "bin": outer})).unwrap();
+    s.execute("project.moveToBin", json!({"items": [ids[1].0], "bin": inner})).unwrap();
+    s.state.project_selection.clear();
+
+    // only the bin's own items: the closed sub-bin's item stays unselected
+    let r = s.execute("project.selectAll", json!({"bin": outer})).unwrap();
+    assert_eq!(r["selected"].as_u64(), Some(1));
+    assert_eq!(s.state.project_selection, vec![ids[0]]);
+
+    // a sub-bin twirled open in List view counts
+    s.execute("project.selectAll", json!({"bin": outer, "expanded": [inner]})).unwrap();
+    let mut sel = s.state.project_selection.clone();
+    sel.sort();
+    assert_eq!(sel, vec![ids[0], ids[1]]);
+
+    // the root: its direct items only, nothing from the (closed) bins
+    let root = s.project.root.id;
+    let mut want: Vec<ItemId> = s
+        .project
+        .root
+        .children
+        .iter()
+        .filter_map(|e| if let BinEntry::Item(i) = e { Some(*i) } else { None })
+        .filter(|i| s.project.item(*i).is_some_and(|it| project_panel::listed(&s.project, it)))
+        .collect();
+    want.sort();
+    s.execute("project.selectAll", json!({"bin": root.0})).unwrap();
+    let mut sel = s.state.project_selection.clone();
+    sel.sort();
+    assert_eq!(sel, want);
+    assert!(!sel.contains(&ids[0]) && !sel.contains(&ids[1]));
+    assert!(sel.len() < s.project.items.len());
+
+    // an open bin inside a closed one is not shown, so it does not count either
+    s.execute("project.selectAll", json!({"bin": root.0, "expanded": [inner]})).unwrap();
+    assert!(!s.state.project_selection.contains(&ids[1]));
+    // ... but open all the way down, it does
+    s.execute("project.selectAll", json!({"bin": root.0, "expanded": [outer, inner]})).unwrap();
+    assert!(s.state.project_selection.contains(&ids[0]) && s.state.project_selection.contains(&ids[1]));
+}
+
+#[test]
+fn select_all_rejects_bad_bins_without_touching_the_selection() {
+    let mut s = demo();
+    let ids = media(&s);
+    let root = s.project.root.id.0;
+    s.execute("project.select", json!({"items": [ids[0].0]})).unwrap();
+    for p in [
+        json!({"bin": 987_654_321u64}),
+        json!({"bin": "footage"}),
+        json!({"bin": -1}),
+        json!({"bin": root, "expanded": "all"}),
+        json!({"bin": root, "expanded": ["x"]}),
+    ] {
+        assert!(s.execute("project.selectAll", p.clone()).is_err(), "{p}");
+        assert_eq!(s.state.project_selection, vec![ids[0]], "{p}");
+    }
+    // unknown ids in `expanded` are simply not open bins
+    assert!(s.execute("project.selectAll", json!({"bin": root, "expanded": [987_654_321u64]})).is_ok());
+    // `bin: null` is the same as no bin: the whole project
+    let r = s.execute("project.selectAll", json!({"bin": null})).unwrap();
+    assert_eq!(r["selected"].as_u64(), Some(s.project.items.len() as u64));
+}
+
+/// New Item / File ▸ New take an optional `bin` and make the item there (#4093).
+#[test]
+fn new_items_land_in_the_given_bin() {
+    let mut s = Session::default();
+    let root = s.project.root.id.0;
+    let bin = s.execute("file.newBin", json!({"name": "Shots"})).unwrap()["bin"].as_u64().unwrap();
+    let cases = [
+        ("file.newSequence", json!({"name": "In bin", "bin": bin}), "sequence"),
+        ("file.newAdjustmentLayer", json!({"bin": bin}), "item"),
+        ("file.newBarsAndTone", json!({"bin": bin}), "item"),
+        ("file.newBlackVideo", json!({"seconds": 2.0, "bin": bin}), "item"),
+        ("file.newColorMatte", json!({"color": "#ff0000", "bin": bin}), "item"),
+        ("file.newCountingLeader", json!({"bin": bin}), "item"),
+        ("file.newTransparentVideo", json!({"bin": bin}), "item"),
+    ];
+    for (command, params, key) in cases {
+        let id = ItemId(s.execute(command, params).unwrap()[key].as_u64().unwrap());
+        assert_eq!(bin_of(&s, id), bin, "{command} lands in the bin");
+        // and not in the root, which only lists the bin itself
+        assert!(!s.project.root.children.iter().any(|c| matches!(c, BinEntry::Item(i) if *i == id)), "{command} is not in the root");
+    }
+    // without a bin, or with null, they still land in the project root
+    for params in [json!({}), json!({"bin": null})] {
+        let id = ItemId(s.execute("file.newBarsAndTone", params).unwrap()["item"].as_u64().unwrap());
+        assert_eq!(bin_of(&s, id), root);
+        let id = ItemId(s.execute("file.newSequence", json!({"bin": null})).unwrap()["sequence"].as_u64().unwrap());
+        assert_eq!(bin_of(&s, id), root);
+    }
+    // a bin that is not there is an error, and makes nothing
+    let (items, undo) = (s.project.items.len(), s.history.undo.len());
+    for (command, params) in
+        [("file.newSequence", json!({"bin": 987_654})), ("file.newBlackVideo", json!({"bin": 987_654})), ("file.newAdjustmentLayer", json!({"bin": "x"}))]
+    {
+        assert!(s.execute(command, params).is_err(), "{command} refuses an unknown bin");
+    }
+    assert_eq!((s.project.items.len(), s.history.undo.len()), (items, undo));
 }

@@ -77,6 +77,25 @@ fn metadata_edits_are_undoable_and_saved_in_the_project() {
     assert_eq!(back.item(id).unwrap().metadata["Scene"], "12");
 }
 
+/// The Out Point is the last frame the marks keep, the frame a Source edit places last and the
+/// Project panel's Video Out Point. It read one frame earlier.
+#[test]
+fn metadata_out_point_is_the_last_frame_kept() {
+    let mut s = demo();
+    let id = s.project.items.values().filter(|i| i.as_media().is_some() && i.has_video()).map(|i| i.id).min().expect("a video clip");
+    s.execute("source.open", json!({"item": id.0})).unwrap();
+    s.execute("markers.markIn", json!({"target": "source", "frame": 24})).unwrap();
+    s.execute("markers.markOut", json!({"target": "source", "frame": 71})).unwrap();
+    let g = s.execute("metadata.get", json!({"item": id.0})).unwrap();
+    let it = s.project.item(id).unwrap();
+    for (field_name, column) in [("In Point", "Video In Point"), ("Out Point", "Video Out Point")] {
+        assert_eq!(field(&g, field_name)["value"], json!(crate::project_panel::cell(&s.project, it, column).0), "{field_name}");
+    }
+    let (_, range) = crate::commands::source_range(&s).unwrap();
+    let rate = it.frame_rate();
+    assert_eq!((rate.frame_at(range.start), rate.frame_at(range.end())), (24, 72), "a Source edit places frames 24 to 71");
+}
+
 #[test]
 fn metadata_targets_follow_the_selection() {
     let mut s = demo();
@@ -155,4 +174,41 @@ fn events_report_background_jobs() {
     // reported once
     s.poll_persistence();
     assert_eq!(s.log.entries.len(), 6);
+}
+
+/// #620: project notes are saved in the project file; typing (one `merge` key) is one undo step.
+#[test]
+fn project_notes_are_saved_and_typing_is_one_undo_step() {
+    let mut s = demo();
+    assert_eq!(s.execute("project.notes", json!({})).unwrap()["text"], "");
+    let undo0 = s.history.undo.len();
+    for text in ["T", "To", "To do: fix the logo at 00:01:02:03"] {
+        s.execute("project.setNotes", json!({"text": text, "merge": "1"})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), undo0 + 1, "one typing session, one undo step");
+    assert_eq!(s.history.undo.last().unwrap().0, "Edit Project Notes");
+    // the same text again changes nothing and adds no step
+    let r = s.execute("project.setNotes", json!({"text": "To do: fix the logo at 00:01:02:03"})).unwrap();
+    assert_eq!(r["changed"], json!(false));
+    assert_eq!(s.history.undo.len(), undo0 + 1);
+
+    let loaded = filmcraft_format::decode(&filmcraft_format::encode(&s.project, false)).unwrap();
+    assert_eq!(loaded.project.notes, "To do: fix the logo at 00:01:02:03");
+    // an older file without notes still loads, with none
+    let mut doc: Value = serde_json::from_slice(&filmcraft_format::encode(&filmcraft_project::Project::new("old"), false)).unwrap();
+    doc["schema_version"] = json!(14);
+    assert_eq!(filmcraft_format::decode(&serde_json::to_vec(&doc).unwrap()).unwrap().project.notes, "");
+
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project.notes, "");
+}
+
+#[test]
+fn project_notes_refuse_bad_input() {
+    let mut s = demo();
+    assert!(s.execute("project.setNotes", json!({})).is_err());
+    assert!(s.execute("project.setNotes", json!({"text": 5})).is_err());
+    let huge = "x".repeat(crate::panels::MAX_NOTES_BYTES + 1);
+    assert!(s.execute("project.setNotes", json!({"text": huge})).is_err());
+    assert_eq!(s.project.notes, "");
 }

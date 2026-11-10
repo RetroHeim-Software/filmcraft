@@ -30,7 +30,7 @@ pub struct MaskSel {
 }
 
 fn spec(id: &'static str, label: &'static str, params: &'static str, run: Run) -> CommandSpec {
-    CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: has_seq, run, journal: true }
+    CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: has_seq, run, journal: true, named: crate::commands::NamedKeys::NONE }
 }
 
 pub(crate) fn commands() -> Vec<CommandSpec> {
@@ -38,7 +38,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec(
             "masks.add",
             "Create Mask",
-            r#"{"clip":id?,"effect":index|id?="opacity","shape":"ellipse"|"polygon"|"bezier","path":[[x,y]…]|{vertices}?,"center":[x,y]?,"size":[w,h]?}"#,
+            r#"{"clip":id?,"effect":index|id?="opacity","shape":"ellipse"|"polygon"|"rectangle"|"bezier","path":[[x,y]…]|{vertices}?,"center":[x,y]?,"size":[w,h]?,"cornerRadius":px?}"#,
             add,
         ),
         spec("masks.remove", "Delete Mask", r#"{"clip":id?,"effect":index|id?,"mask":n?}"#, remove),
@@ -51,7 +51,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec(
             "masks.moveVertex",
             "Move Mask Vertex",
-            r#"{"clip":id?,"effect":index|id?,"mask":n?,"vertex":n,"handle":"point"|"in"|"out"?,"to":[x,y]?|"delta":[dx,dy]?,"breakHandles":bool?,"merge":key?}"#,
+            r#"{"clip":id?,"effect":index|id?,"mask":n?,"vertex":n|"vertices":[n],"handle":"point"|"in"|"out"?,"to":[x,y]?|"delta":[dx,dy]?,"breakHandles":bool?,"merge":key?}"#,
             move_vertex,
         ),
         spec("masks.translate", "Move Mask", r#"{"clip":id?,"effect":index|id?,"mask":n?,"delta":[dx,dy],"merge":key?}"#, translate),
@@ -64,6 +64,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             track,
         ),
         spec("masks.toggleVertexSmooth", "Convert Mask Vertex", r#"{"clip":id?,"effect":index|id?,"mask":n?,"vertex":n}"#, toggle_smooth),
+        spec("masks.roundCorners", "Round Mask Corners", r#"{"clip":id?,"effect":index|id?,"mask":n?,"radius":px,"vertices":[n]?}"#, round_corners),
         CommandSpec {
             id: "masks.select",
             label: "Select Mask",
@@ -73,6 +74,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             enabled: has_seq,
             run: select,
             journal: false,
+            named: crate::commands::NamedKeys::NONE,
         },
         CommandSpec {
             id: "masks.list",
@@ -83,6 +85,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             enabled: has_seq,
             run: list,
             journal: false,
+            named: crate::commands::NamedKeys::NONE,
         },
     ]
 }
@@ -90,9 +93,12 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
 /// A mask path from JSON: the serialized [`MaskPath`] object, an array of vertices
 /// (`{"p":[x,y],"in":[x,y]?,"out":[x,y]?}`), or an array of `[x, y]` / `{"x","y"}` points.
 pub fn path_from_json(v: &Value) -> Option<MaskPath> {
-    if let Ok(p) = serde_json::from_value::<MaskPath>(v.clone()) {
-        return Some(p);
-    }
+    // The vertex forms first: serde also accepts `{"p","in","out"}` vertices (the `masks.list` /
+    // `masks.add` form) but silently drops the unknown `in` / `out` tangents.
+    vertex_path(v).or_else(|| serde_json::from_value::<MaskPath>(v.clone()).ok())
+}
+
+fn vertex_path(v: &Value) -> Option<MaskPath> {
     let arr = v.as_array().or_else(|| v.get("vertices").and_then(Value::as_array))?;
     let closed = v.get("closed").and_then(Value::as_bool).unwrap_or(true);
     let mut vertices = Vec::new();
@@ -180,7 +186,7 @@ fn edit_mask<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut Mas
     let body = move |pr: &mut filmcraft_project::Project, _: &mut crate::EditorState| -> Result<R> {
         let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
-        let mt = it.source_time_at(ph.clamp(it.start, it.end() - Tick(1)));
+        let mt = it.effect_time_at(ph.clamp(it.start, it.end() - Tick(1)));
         let ei = effect_index(&it.effects, eff.as_ref(), sel, clip).ok_or_else(|| bad(label, "no such effect on clip"))?;
         let e = &mut it.effects[ei];
         let mi = mask_i.ok_or_else(|| bad(label, "need `mask`"))?;
@@ -212,7 +218,12 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         None => match shape.as_str() {
             "ellipse" => MaskPath::ellipse(center, size * 0.5),
             "polygon" | "rectangle" | "rect" | "4-point" => {
-                MaskPath::rect(center.x - size.x / 2.0, center.y - size.y / 2.0, center.x + size.x / 2.0, center.y + size.y / 2.0)
+                let (x0, y0, x1, y1) = (center.x - size.x / 2.0, center.y - size.y / 2.0, center.x + size.x / 2.0, center.y + size.y / 2.0);
+                match f64_p(p, "cornerRadius") {
+                    Some(r) if !r.is_finite() || r < 0.0 => return Err(bad("masks.add", "`cornerRadius` is pixels ≥ 0")),
+                    Some(r) => MaskPath::rounded_rect(x0, y0, x1, y1, r),
+                    None => MaskPath::rect(x0, y0, x1, y1),
+                }
             }
             _ => return Err(bad("masks.add", "a bezier mask needs `path` (pen points)")),
         },
@@ -238,6 +249,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         e.masks.push(Mask::new(name.clone(), path));
         let mi = e.masks.len() - 1;
         st.selected_mask = Some(MaskSel { clip, effect: ei, mask: mi });
+        st.selected_effect = None;
         Ok((ei, mi, name))
     })?;
     Ok(json!({"clip": clip.0, "effect": ei, "mask": mi, "name": name}))
@@ -314,6 +326,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn move_vertex(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("vertices").is_some_and(|v| !v.is_null()) {
+        return move_vertices(s, p);
+    }
     let vi = u64_p(p, "vertex").ok_or_else(|| bad("masks.moveVertex", "need `vertex`"))? as usize;
     let handle = str_p(p, "handle").unwrap_or("point").to_string();
     let to = p.get("to").and_then(pt);
@@ -345,6 +360,33 @@ fn move_vertex(s: &mut Session, p: &Value) -> Result<Value> {
             _ => {
                 v.p = to.unwrap_or_else(|| v.p + delta.unwrap_or_default());
             }
+        }
+        set_path_at(m, t, path);
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
+/// `masks.moveVertex` with `vertices`: the listed points move by `delta` together, in one edit
+/// (the multi-vertex drag on the Program monitor). Any index past the path moves nothing.
+fn move_vertices(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "masks.moveVertex";
+    let list = p.get("vertices").and_then(Value::as_array).ok_or_else(|| bad(ID, "`vertices` is a list of vertex indices"))?;
+    let mut only = list
+        .iter()
+        .map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad(ID, "`vertices` is a list of vertex indices")))
+        .collect::<Result<Vec<_>>>()?;
+    only.sort_unstable();
+    only.dedup();
+    if str_p(p, "handle").is_some_and(|h| h != "point") || p.get("to").is_some() {
+        return Err(bad(ID, "`vertices` moves points by `delta`"));
+    }
+    let d = p.get("delta").and_then(pt).ok_or_else(|| bad(ID, "need `delta`"))?;
+    edit_mask(s, p, "Move Mask Vertex", move |m, t| {
+        let mut path = m.path_at(t);
+        for &vi in &only {
+            let v = path.vertices.get_mut(vi).ok_or_else(|| bad(ID, format!("no vertex {vi}")))?;
+            v.p = v.p + d;
         }
         set_path_at(m, t, path);
         Ok(())
@@ -454,6 +496,40 @@ fn toggle_smooth(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// Round the mask's sharp corners (Premiere 26's rounded rectangle masks): every corner between
+/// two straight edges (or only the listed `vertices`) becomes a circular fillet of `radius`
+/// pixels, shrunk to fit half of each edge. The same corners are rounded in every Mask Path
+/// keyframe so an animated path keeps interpolating. Returns how many corners were rounded.
+fn round_corners(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "masks.roundCorners";
+    let radius = f64_p(p, "radius").filter(|r| r.is_finite() && *r > 0.0).ok_or_else(|| bad(ID, "need `radius` (pixels, > 0)"))?;
+    let only: Option<Vec<usize>> = match p.get("vertices") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let list = v.as_array().ok_or_else(|| bad(ID, "`vertices` is a list of vertex indices"))?;
+            let mut out = list
+                .iter()
+                .map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad(ID, "`vertices` is a list of vertex indices")))
+                .collect::<Result<Vec<_>>>()?;
+            out.sort_unstable();
+            out.dedup();
+            Some(out)
+        }
+    };
+    let rounded = edit_mask(s, p, "Round Mask Corners", move |m, t| {
+        let mut corners = m.path_at(t).roundable_corners();
+        if let Some(only) = &only {
+            corners.retain(|i| only.binary_search(i).is_ok());
+        }
+        if corners.is_empty() {
+            return Err(bad(ID, "no sharp corner between straight edges to round"));
+        }
+        drop_all(m, t, |path| *path = path.with_rounded_corners(radius, &corners));
+        Ok(corners.len())
+    })?;
+    Ok(json!({"corners": rounded}))
+}
+
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
     if bool_p(p, "none") == Some(true) || p.is_null() || p.as_object().is_some_and(|o| o.is_empty()) {
         s.state.selected_mask = None;
@@ -468,6 +544,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("masks.select", format!("no mask {mi}")));
     }
     s.state.selected_mask = Some(MaskSel { clip, effect: ei, mask: mi });
+    s.state.selected_effect = None;
     Ok(Value::Null)
 }
 
@@ -482,7 +559,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             if only.is_some_and(|c| c != it.id) {
                 continue;
             }
-            let mt = it.source_time_at(ph.clamp(it.start, it.end() - Tick(1)));
+            let mt = it.effect_time_at(ph.clamp(it.start, it.end() - Tick(1)));
             for (ei, e) in it.effects.iter().enumerate() {
                 for (mi, m) in e.masks.iter().enumerate() {
                     out.push(json!({
@@ -528,6 +605,8 @@ pub struct PendingTrack {
     /// (media time, path) in tracking order.
     pub keys: Arc<Mutex<Vec<(Tick, MaskPath)>>>,
     applied: usize,
+    /// `Session::document_epoch` when the job started; a different value means the project was replaced.
+    epoch: u64,
 }
 
 /// Longest side of the frames the tracker works on (speed; the result is in clip pixels).
@@ -647,7 +726,7 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     s.jobs.push(job);
-    s.mask_jobs.push(PendingTrack { job: id, target: MaskSel { clip, effect: ei, mask: mi }, seq: seq_id, keys, applied: 0 });
+    s.mask_jobs.push(PendingTrack { job: id, target: MaskSel { clip, effect: ei, mask: mi }, seq: seq_id, keys, applied: 0, epoch: s.document_epoch });
     let wait = crate::commands::bool_p(p, "wait").unwrap_or(false);
     if wait || cfg!(target_arch = "wasm32") {
         run();
@@ -663,13 +742,33 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Cancel and drop every pending tracking job. Called when the project is replaced, so a job started
+/// on the old project can never write its result into the new one.
+pub fn discard_jobs(s: &mut Session) {
+    use std::sync::atomic::Ordering;
+    for pj in std::mem::take(&mut s.mask_jobs) {
+        if let Some(j) = s.jobs.iter().find(|j| j.id == pj.job) {
+            j.progress.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Write newly tracked paths as Mask Path keyframes (one merged undo step per tracking job) and
-/// drop finished jobs. Called from [`Session::poll_persistence`] (once per UI frame) and after
-/// synchronous runs.
+/// drop finished jobs. Called from [`Session::poll_persistence`] (once per UI frame), before each
+/// top-level [`Session::execute`] (headless sessions) and after synchronous runs.
 pub fn poll(s: &mut Session) {
     use std::sync::atomic::Ordering;
     let mut i = 0;
     while i < s.mask_jobs.len() {
+        if s.mask_jobs[i].epoch != s.document_epoch {
+            // the project was replaced under the job: its result belongs to a document that is gone
+            s.error_toast("masks.track", "the project was replaced; mask tracking stopped");
+            if let Some(j) = s.jobs.iter().find(|j| j.id == s.mask_jobs[i].job) {
+                j.progress.cancel.store(true, Ordering::Relaxed);
+            }
+            s.mask_jobs.remove(i);
+            continue;
+        }
         let finished = s.jobs.iter().find(|j| j.id == s.mask_jobs[i].job).is_none_or(|j| j.progress.finished.load(Ordering::Relaxed));
         let new: Vec<(Tick, MaskPath)> = {
             let pj = &s.mask_jobs[i];
