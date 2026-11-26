@@ -1,6 +1,8 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 reviews:
   auto_review:
+    # Owner rule for this fork: no CodeRabbit reviews on any pull request.
+    enabled: false
     # Dependabot bumps are checked by CI; skip CodeRabbit reviews on them.
     ignore_usernames:
       - "dependabot[bot]"
