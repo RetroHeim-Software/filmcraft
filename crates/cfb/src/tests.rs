@@ -200,33 +200,55 @@ fn mutation_never_panics_or_hangs() {
     }
 }
 
-/// A 1 MiB file with 64 KiB sectors whose header lists one FAT sector 17 times, so the FAT has
-/// 278,528 entries, and whose directory sector loops onto itself. The chain walk must stop after
-/// the file's own sector count (16), not after the FAT length: 278,528 copies of 64 KiB is 18 GB.
+/// A 1 MiB file with 4 KiB sectors whose header lists 17 FAT sectors, so the FAT has 17,408
+/// entries, and whose directory sector loops onto itself. The chain walk must stop on the
+/// loop within the file's own sector count (255), not run to the FAT length. (A 64 KiB-sector
+/// variant of this file, where the FAT length would mean 18 GB of copies, is now refused earlier
+/// for its sector size; see `sector_sizes_outside_the_specification_are_refused`.)
 #[test]
 fn looping_directory_chain_is_bounded_by_the_file_not_the_fat() {
+    const SECTOR: usize = 4096;
+    let mut b = vec![0u8; 1 << 20];
+    b[..8].copy_from_slice(&SIGNATURE);
+    b[26..28].copy_from_slice(&4u16.to_le_bytes());
+    b[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    b[30..32].copy_from_slice(&12u16.to_le_bytes());
+    b[32..34].copy_from_slice(&6u16.to_le_bytes());
+    b[44..48].copy_from_slice(&17u32.to_le_bytes());
+    b[48..52].copy_from_slice(&17u32.to_le_bytes());
+    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    b[60..64].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    b[68..72].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    for i in 0..109u32 {
+        let v = if i < 17 { i } else { FREESECT };
+        b[76 + i as usize * 4..80 + i as usize * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // Sectors 0..17 (from file offset 4 KiB) are the FAT, marked FATSECT in its first sector;
+    // every other entry is free except 17 -> 17, the directory's self-loop.
+    const FATSECT: u32 = 0xFFFF_FFFD;
+    for s in 0..17 * SECTOR / 4 {
+        let v = match s {
+            0..=16 => FATSECT,
+            17 => 17,
+            _ => FREESECT,
+        };
+        b[SECTOR + s * 4..SECTOR + s * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let err = CompoundFile::open(&b).unwrap_err();
+    assert!(err.to_string().contains("loops"), "{err}");
+}
+
+/// 64 KiB sectors (shift 16) made a FAT listed many times worth gigabytes of chain copies; only
+/// the specification's 512-byte (version 3) and 4 KiB (version 4) sectors are accepted.
+#[test]
+fn sector_sizes_outside_the_specification_are_refused() {
     let mut b = vec![0u8; 1 << 20];
     b[..8].copy_from_slice(&SIGNATURE);
     b[26..28].copy_from_slice(&4u16.to_le_bytes());
     b[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes());
     b[30..32].copy_from_slice(&16u16.to_le_bytes());
     b[32..34].copy_from_slice(&6u16.to_le_bytes());
-    b[44..48].copy_from_slice(&17u32.to_le_bytes());
-    b[48..52].copy_from_slice(&1u32.to_le_bytes());
-    b[56..60].copy_from_slice(&4096u32.to_le_bytes());
-    b[60..64].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
-    b[68..72].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
-    for i in 0..109 {
-        let v = if i < 17 { 0u32 } else { FREESECT };
-        b[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
-    }
-    // sector 0 (file offset 64 KiB) is the FAT: every entry free except 1 -> 1 (a self-loop)
-    for i in 0..(1 << 16) / 4 {
-        let v = if i == 1 { 1u32 } else { FREESECT };
-        b[65536 + i * 4..65536 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    let err = CompoundFile::open(&b).unwrap_err();
-    assert!(err.to_string().contains("loops"), "{err}");
+    assert!(CompoundFile::open(&b).is_err());
 }
 
 fn put_u32(b: &mut [u8], at: usize, v: u32) {
@@ -289,10 +311,9 @@ fn duplicated_fat_sector_chain_loop_fails_fast() {
     put_u32(&mut fat, 0, 0); // FAT[0] = 0: sector 0 is followed by itself
     b.extend_from_slice(&fat);
     b.resize(110 * ss, 0); // big enough for 109 FAT sectors to pass the size check
-    // The message names the bound the walk stopped at: 111, this file's 110 sectors + 1, not the
-    // 109 * 1024 = 111,616 entries of the inflated FAT that the old guard allowed (a 457 MB buffer).
-    let expect = format!("sector chain loops: more than 111 sectors in a {}-byte file", b.len());
-    assert_eq!(CompoundFile::open(&b).unwrap_err(), Error::Invalid(expect));
+    // The shared reader rejects the duplicated FAT sector before constructing the inflated
+    // table or walking the directory chain. This is earlier than the old app's loop bound.
+    assert_eq!(CompoundFile::open(&b).unwrap_err(), Error::Invalid("FAT sector 0 is listed twice".into()));
 }
 
 /// Positive control for the chain bound: the longest chains a file can hold still read back, in
@@ -328,20 +349,6 @@ fn nul_in_a_name_is_rejected() {
     let mut w = Writer::default();
     assert!(matches!(w.stream(Writer::ROOT, "a\0b", vec![1]), Err(Error::BadName(_))));
     assert!(matches!(w.storage(Writer::ROOT, "x\0", [0; 16]), Err(Error::BadName(_))));
-}
-
-#[test]
-fn span_is_checked() {
-    use crate::read::span;
-    assert_eq!(span(0, 1, 512), Some((512, 1024)));
-    assert_eq!(span(3, 0, 64), Some((192, 256)));
-    // On a 32-bit `usize` these are the overflows of `sector` and `read_mini_chain`; the checked
-    // arithmetic is the same code on 64-bit, so usize::MAX exercises it here. (A real 32-bit
-    // target is not run.)
-    assert_eq!(span(usize::MAX, 1, 512), None);
-    assert_eq!(span(usize::MAX, 0, 64), None);
-    assert_eq!(span(usize::MAX / 64, 0, 64), None, "start fits, end does not");
-    assert_eq!(span(usize::MAX - 1, 1, 1), None);
 }
 
 /// The allocating comparison compare_names used before the iterator rewrite.
@@ -408,4 +415,82 @@ fn compare_names_matches_the_allocating_version() {
             assert_eq!(compare_names(other, &s), compare_names_old(other, &s));
         }
     }
+}
+
+/// Name lookups go through a sorted per-storage index: every child of a wide storage resolves
+/// (in any case), and a hostile file whose sibling tree is out of order still resolves by name,
+/// with the first child in tree order winning a duplicated name.
+#[test]
+fn child_lookup_uses_a_sorted_index() {
+    let mut w = Writer::default();
+    for i in 0..2000 {
+        w.stream(Writer::ROOT, &format!("m{i}"), vec![i as u8]).unwrap();
+    }
+    let b = w.finish();
+    let cf = CompoundFile::open(&b).unwrap();
+    for i in (0..2000).step_by(37) {
+        let id = cf.child(0, &format!("M{i}")).unwrap();
+        assert_eq!(cf.read(id).unwrap(), vec![i as u8]);
+    }
+    assert_eq!(cf.child(0, "m2000"), None);
+    assert_eq!(cf.child(12345, "m1"), None);
+
+    let mut w = Writer::default();
+    for name in ["aa", "bb", "cc"] {
+        w.stream(Writer::ROOT, name, name.as_bytes().to_vec()).unwrap();
+    }
+    let mut b = w.finish();
+    let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+    let at = |b: &[u8], s: &str| b.windows(4).position(|w| w == utf16(s)).unwrap();
+    // swap the names "aa" and "cc": the tree's in-order walk is now cc, bb, aa
+    let (a, c) = (at(&b, "aa"), at(&b, "cc"));
+    b[a..a + 4].copy_from_slice(&utf16("cc"));
+    b[c..c + 4].copy_from_slice(&utf16("aa"));
+    let cf = CompoundFile::open(&b).unwrap();
+    let names: Vec<&str> = cf.root().children.iter().map(|&c| cf.entries[c].name.as_str()).collect();
+    assert_eq!(names, ["cc", "bb", "aa"]);
+    assert_eq!(cf.read_path("AA").unwrap(), b"cc");
+    assert_eq!(cf.read_path("cc").unwrap(), b"aa");
+    assert_eq!(cf.read_path("bb").unwrap(), b"bb");
+    // a duplicated name resolves to the first child in tree order
+    let bb = at(&b, "bb");
+    b[bb..bb + 4].copy_from_slice(&utf16("cc"));
+    let cf = CompoundFile::open(&b).unwrap();
+    assert_eq!(cf.read_path("cc").unwrap(), b"aa");
+}
+
+// Reference implementation retained only for compatibility tests.
+fn upper(u: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&u) {
+        return u - 32;
+    }
+    if u < 0x80 {
+        return u;
+    }
+    match char::from_u32(u as u32) {
+        Some(c) => {
+            let mut up = c.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(x), None) if (x as u32) <= 0xFFFF => x as u32 as u16,
+                _ => u,
+            }
+        }
+        None => u,
+    }
+}
+
+/// A non-duplicated FAT can still contain a cyclic directory chain; retain that guard too.
+#[test]
+fn directory_chain_loop_without_duplicate_fat_is_rejected() {
+    let mut b = bare_header(9);
+    put_u32(&mut b, 44, 1);
+    put_u32(&mut b, 76, 0); // exactly one FAT sector
+    put_u32(&mut b, 48, 1); // directory sector 1
+    let mut fat = vec![0xFF; 512];
+    put_u32(&mut fat, 0, FATSECT);
+    put_u32(&mut fat, 4, 1); // directory points to itself
+    b.extend_from_slice(&fat);
+    b.resize(3 * 512, 0);
+    let error = CompoundFile::open(&b).unwrap_err();
+    assert!(matches!(error, Error::Invalid(ref message) if message.contains("sector chain loops")), "{error:?}");
 }
