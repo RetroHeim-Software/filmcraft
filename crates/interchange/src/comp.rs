@@ -15,7 +15,7 @@ use filmcraft_project::{
     AudioChannels, ClipId, Interpolation, ItemId, ItemKind, Keyframe, Label, Marker, MarkerId, MarkerKind, MediaRef, Param, ParamValue, Project, Sequence,
     Track, TrackItem, TrackKind, Transition, TransitionAlign, TransitionId, find_effect,
 };
-use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use filmcraft_time::{FrameRate, Tick};
 
 use crate::common::{Builder, MediaSpec, base_item, db_to_gain, file_name, file_stem, gain_to_db, param, set_param, settings_for, transition_effect};
 use crate::essence::{EssenceData, EssenceKey, MediaOptions};
@@ -81,16 +81,6 @@ pub(crate) enum CItem {
     Filler(Tick),
     Clip(CClip),
     Transition(CTransition),
-}
-
-impl CItem {
-    pub fn len(&self) -> Tick {
-        match self {
-            CItem::Filler(l) => *l,
-            CItem::Clip(c) => c.len,
-            CItem::Transition(t) => t.len,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1000,47 +990,6 @@ fn link_clips(b: &mut Builder, seq: &mut Sequence) {
 
 /// The largest time read from a document (about 3.3 days).
 pub(crate) const MAX_TIME: Tick = Tick(1 << 56);
-
-/// Ticks of `n` edit units at rate `num/den` (rounded to the nearest tick).
-pub(crate) fn units_to_ticks(n: i64, num: i64, den: i64) -> Tick {
-    if num <= 0 || den <= 0 {
-        return Tick::ZERO;
-    }
-    // `n` and `den` come from the document: the product of three large values overflows `i128`
-    // (a panic in debug, a wrong time in release), so it saturates and the clamp below decides.
-    let t = (n as i128).saturating_mul(den as i128).saturating_mul(TICKS_PER_SECOND as i128);
-    let q = t.div_euclid(num as i128);
-    let r = t.rem_euclid(num as i128);
-    // documents are untrusted: keep every time far from overflow (±3 days)
-    Tick((q + if r * 2 >= num as i128 { 1 } else { 0 }).clamp(-MAX_TIME.0 as i128, MAX_TIME.0 as i128) as i64)
-}
-
-/// Edit units at rate `num/den` nearest to `t`; the flag is false when `t` is not on a unit.
-pub(crate) fn ticks_to_units(t: Tick, num: i64, den: i64) -> (i64, bool) {
-    if num <= 0 || den <= 0 {
-        return (0, false);
-    }
-    let x = t.0 as i128 * num as i128;
-    let d = den as i128 * TICKS_PER_SECOND as i128;
-    let q = x.div_euclid(d);
-    let r = x.rem_euclid(d);
-    let n = q + if r * 2 >= d { 1 } else { 0 };
-    (n.clamp(i64::MIN as i128, i64::MAX as i128) as i64, r == 0)
-}
-
-#[cfg(test)]
-mod hostile_unit_tests {
-    use super::*;
-
-    #[test]
-    fn units_to_ticks_saturates_instead_of_overflowing() {
-        assert_eq!(units_to_ticks(i64::MAX, 1, i64::MAX), MAX_TIME);
-        assert_eq!(units_to_ticks(i64::MIN, 1, i64::MAX), Tick(-MAX_TIME.0));
-        assert_eq!(units_to_ticks(i64::MAX, 1, i32::MAX as i64), MAX_TIME);
-        assert_eq!(units_to_ticks(48_000, 48_000, 1), Tick(TICKS_PER_SECOND));
-        assert_eq!(units_to_ticks(1, 0, 1), Tick::ZERO);
-    }
-}
 
 /// The name an exported audio track gets: the track's own name (what an editor called it, e.g.
 /// a role such as `Dialogue.Dialogue-1`, which is what a sound editor's DAW shows), else `A<n>`;

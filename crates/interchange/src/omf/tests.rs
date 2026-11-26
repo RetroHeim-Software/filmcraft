@@ -88,7 +88,7 @@ fn written_files_have_the_required_structure() {
     let c = Container::open(&bytes).unwrap();
     let class = |o: u32| c.get(o, "OMFI:OOBJ:ObjClass").map(|v| String::from_utf8_lossy(&v).to_string());
     let mut by_class: HashMap<String, Vec<u32>> = HashMap::new();
-    for &o in c.objects.keys() {
+    for o in c.object_ids() {
         if let Some(k) = class(o) {
             by_class.entry(k).or_default().push(o);
         }
@@ -232,6 +232,6 @@ fn a_self_fanning_sequence_is_cut_off_by_the_visit_budget() {
     let bytes = w.finish();
     let started = std::time::Instant::now();
     let (_, report) = crate::import_with(&bytes, crate::Format::Omf, &Default::default()).unwrap();
-    assert!(report.mentions("too many times"), "{report}");
+    assert!(report.mentions("too large to import completely"), "{report}");
     assert!(started.elapsed().as_secs() < 30);
 }

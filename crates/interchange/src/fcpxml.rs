@@ -9,6 +9,8 @@
 //! - Rational times (`1001/24000s`) map exactly onto ticks.
 //! - Standalone `video` elements reference the picture of an asset (including still images),
 //!   without importing that asset's audio. Effect-backed generators are reported as unsupported.
+//! - `adjust-conform` (`fit`, the default, and `none`) maps to the clip's scale-to-frame-size flag;
+//!   `fill` is reported and imported as `fit`.
 //! - `adjust-transform` (position in percent of frame height, FCP y-up, counter-clockwise
 //!   rotation), `adjust-blend` (opacity), `adjust-volume` (dB) and their keyframes are mapped;
 //!   constant speed, reverse and freeze frames use a two-point `timeMap`.
@@ -139,6 +141,14 @@ struct Asset {
     has_audio: bool,
 }
 
+/// Most times truncated media is imported again at a shallower depth.
+const MAX_REIMPORTS: usize = 4096;
+
+/// Deepest storyline/element nesting a hostile file may walk. The FCPXML structure can nest
+/// connected clips and secondary storylines without limit, and layout recurses once per level
+/// (audit: FilmCraft F3).
+const MAX_XML_DEPTH: usize = 128;
+
 struct Imp<'a, 'i, 'r> {
     b: Builder,
     opts: &'a ImportOptions,
@@ -149,15 +159,18 @@ struct Imp<'a, 'i, 'r> {
     media_nodes: HashMap<String, Node<'a, 'i>>,
     media_items: HashMap<String, ItemId>,
     media_active: HashSet<String>,
+    /// Traversals cut short by either the media-chain or XML-layout depth limit.
+    depth_hits: usize,
+    /// Media imported incomplete (a nested one below it was left out), by id: the
+    /// (media-chain, XML-layout) depths it was imported at. Retry when neither depth is
+    /// worse and at least one is shallower; both limits must still be respected.
+    media_truncated_at: HashMap<String, (usize, usize)>,
+    /// Re-imports of truncated media still allowed.
+    reimports_left: usize,
     effects: HashMap<String, String>,
-    /// How deep the storyline elements being laid out are nested (connected clips and secondary
-    /// storylines recurse); bounded by [`MAX_NESTING`] so deep input cannot exhaust the stack.
+    /// Current storyline/element nesting, checked against [`MAX_XML_DEPTH`].
     depth: usize,
 }
-
-/// Deepest nesting of connected clips / secondary storylines that is imported. Real projects use
-/// two or three levels; the parser limits the number of nodes but not their depth.
-const MAX_NESTING: usize = 16;
 
 /// Where an element's keyframe times start, the media time it starts at and its playback speed.
 #[derive(Clone, Copy)]
@@ -205,6 +218,9 @@ pub(crate) fn import(text: &str, opts: &ImportOptions, report: &mut Report) -> R
         media_nodes: HashMap::new(),
         media_items: HashMap::new(),
         media_active: HashSet::new(),
+        depth_hits: 0,
+        media_truncated_at: HashMap::new(),
+        reimports_left: MAX_REIMPORTS,
         effects: HashMap::new(),
         depth: 0,
     };
@@ -249,7 +265,7 @@ pub(crate) fn import(text: &str, opts: &ImportOptions, report: &mut Report) -> R
                 "project" => {
                     if let Some(s) = child(c, "sequence") {
                         let name = c.attribute("name").unwrap_or("Project");
-                        let id = imp.sequence(s, name, Some(bin));
+                        let id = imp.sequence(s, name, Some(bin), None);
                         imp.b.top.push(id);
                     }
                 }
@@ -264,7 +280,7 @@ pub(crate) fn import(text: &str, opts: &ImportOptions, report: &mut Report) -> R
     }
     for p in children(root, "project") {
         if let Some(s) = child(p, "sequence") {
-            let id = imp.sequence(s, p.attribute("name").unwrap_or("Project"), None);
+            let id = imp.sequence(s, p.attribute("name").unwrap_or("Project"), None, None);
             imp.b.top.push(id);
         }
     }
@@ -325,11 +341,29 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
 
     /// Nested sequence from a `<media>` resource.
     fn media(&mut self, id: &str) -> Option<ItemId> {
+        let depth = self.media_active.len();
+        let mut again = None;
         if let Some(i) = self.media_items.get(id) {
-            return Some(*i);
+            // Imported with a nested one cut off: import it again (into the same item) where that
+            // one now fits.
+            let shallower =
+                self.media_truncated_at.get(id).is_some_and(|&(media, xml)| depth <= media && self.depth <= xml && (depth < media || self.depth < xml))
+                    && !self.media_active.contains(id);
+            if !shallower || self.reimports_left == 0 {
+                return Some(*i);
+            }
+            self.reimports_left -= 1;
+            again = Some(*i);
         }
         let n = *self.media_nodes.get(id)?;
         let s = child(n, "sequence")?;
+        // The active set is the current nesting chain: a long acyclic chain of compound clips
+        // would otherwise recurse once per resource.
+        if depth >= crate::MAX_NESTING_DEPTH {
+            self.depth_hits += 1;
+            self.report.warn(format!("FCPXML media resource {id:?} is nested too deeply; imported as a gap"));
+            return None;
+        }
         if !self.media_active.insert(id.into()) {
             self.report.warn(format!("recursive FCPXML media resource {id:?} ignored"));
             return None;
@@ -337,20 +371,26 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         // Mark the resource before descending: a compound clip can reference itself through a
         // ref-clip before a completed sequence is available to cache.
         let name = n.attribute("name").unwrap_or("Compound Clip").to_string();
-        let item = self.sequence(s, &name, None);
+        let hits_before = self.depth_hits;
+        let item = self.sequence(s, &name, None, again);
         self.media_active.remove(id);
         self.media_items.insert(id.into(), item);
+        if self.depth_hits > hits_before {
+            self.media_truncated_at.insert(id.into(), (depth, self.depth));
+        } else {
+            self.media_truncated_at.remove(id);
+        }
         Some(item)
     }
 
-    fn sequence(&mut self, s: Node<'a, 'i>, name: &str, bin: Option<BinId>) -> ItemId {
+    fn sequence(&mut self, s: Node<'a, 'i>, name: &str, bin: Option<BinId>, reuse: Option<ItemId>) -> ItemId {
         let (rate, w, h) = s.attribute("format").and_then(|f| self.formats.get(f)).copied().unwrap_or((FrameRate::default(), 1920, 1080));
         let df = s.attribute("tcFormat") == Some("DF");
         let mut settings = settings_for(rate, w, h, df);
         if let Some(sr) = s.attribute("audioRate").and_then(parse_audio_rate) {
             settings.sample_rate = sr;
         }
-        let id = self.b.reserve_sequence(name, settings.clone(), bin);
+        let id = reuse.unwrap_or_else(|| self.b.reserve_sequence(name, settings.clone(), bin));
         let mut seq = empty_sequence(settings);
         let tc_start = attr_time(s, "tcStart").unwrap_or(Tick::ZERO);
         seq.start_timecode = rate.frame_at(tc_start);
@@ -366,9 +406,21 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         id
     }
 
+    /// Lay out a storyline, refusing nesting past [`MAX_XML_DEPTH`].
+    fn storyline(&mut self, seq: &mut Sequence, ctx: &Ctx, spine: Node<'a, 'i>, origin: Tick, lane: i32, primary: bool) {
+        if self.depth >= MAX_XML_DEPTH {
+            self.depth_hits += 1;
+            self.report.warn(format!("XML storylines are nested too deeply (more than {MAX_XML_DEPTH}); deeper clips were skipped"));
+            return;
+        }
+        self.depth += 1;
+        self.storyline_inner(seq, ctx, spine, origin, lane, primary);
+        self.depth -= 1;
+    }
+
     /// Lay out a storyline. `origin` maps the storyline's offsets to timeline time
     /// (`timeline = origin + offset`). `lane` is the storyline's lane (0 = primary).
-    fn storyline(&mut self, seq: &mut Sequence, ctx: &Ctx, spine: Node<'a, 'i>, origin: Tick, lane: i32, primary: bool) {
+    fn storyline_inner(&mut self, seq: &mut Sequence, ctx: &Ctx, spine: Node<'a, 'i>, origin: Tick, lane: i32, primary: bool) {
         // (timeline start, timeline end, video clip on this storyline's track)
         let mut laid: Vec<(Tick, Tick, Option<filmcraft_project::ClipId>)> = Vec::new();
         let mut transitions: Vec<(usize, Node)> = Vec::new();
@@ -425,20 +477,21 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         }
     }
 
-    /// Lay out one storyline element at timeline time `t0`. Returns (timeline end, video clip).
-    /// Elements nested deeper than [`MAX_NESTING`] are skipped with a warning.
+    /// Lay out one element, refusing nesting past [`MAX_XML_DEPTH`].
     fn element(&mut self, seq: &mut Sequence, ctx: &Ctx, el: Node<'a, 'i>, t0: Tick, lane: i32, primary: bool) -> (Tick, Option<filmcraft_project::ClipId>) {
-        if self.depth >= MAX_NESTING {
-            self.report.warn(format!("FCPXML elements nested more than {MAX_NESTING} levels deep were skipped"));
-            return (t0 + attr_time(el, "duration").unwrap_or(Tick::ZERO), None);
+        if self.depth >= MAX_XML_DEPTH {
+            self.depth_hits += 1;
+            self.report.warn(format!("XML elements are nested too deeply (more than {MAX_XML_DEPTH}); deeper clips were skipped"));
+            return (t0, None);
         }
         self.depth += 1;
-        let out = self.element_at_depth(seq, ctx, el, t0, lane, primary);
+        let out = self.element_inner(seq, ctx, el, t0, lane, primary);
         self.depth -= 1;
         out
     }
 
-    fn element_at_depth(
+    /// Lay out one storyline element at timeline time `t0`. Returns (timeline end, video clip).
+    fn element_inner(
         &mut self,
         seq: &mut Sequence,
         ctx: &Ctx,
@@ -551,7 +604,11 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         }
         // Connected clips and secondary storylines.
         for c in elements(el) {
-            let Some(l) = c.attribute("lane").and_then(|l| l.parse::<i32>().ok()) else { continue };
+            let Some(lane_attr) = c.attribute("lane") else { continue };
+            let Ok(l) = lane_attr.trim().parse::<i32>() else {
+                self.report.warn(format!("<{}> has lane \"{lane_attr}\", which is not a lane a sequence can have; skipped", c.tag_name().name()));
+                continue;
+            };
             let off = attr_time(c, "offset").unwrap_or(Tick::ZERO);
             let ct0 = t0 + (off - local_start);
             let clane = if lane > 0 && l > 0 { lane.saturating_add(l) } else { l };
@@ -597,8 +654,31 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         let kt = |t: Tick| src_in + scaled(t - local_start, speed);
         let (fw, fh) = (ctx.frame.0 as f64, ctx.frame.1 as f64);
         let _ = ctx.seq_rate;
+        // no `adjust-conform` means `fit`: the picture is scaled into the frame before any transform
+        let mut conform = true;
+        // a `<clip>` wraps the video it plays, which may carry its own conform; the clip's own overrides it
+        if kind == TrackKind::Video
+            && el.has_tag_name("clip")
+            && let Some(inner) = elements(el).find(|c| matches!(c.tag_name().name(), "video" | "asset-clip") && c.attribute("ref").is_some())
+            && let Some(a) = elements(inner).find(|a| a.has_tag_name("adjust-conform"))
+        {
+            let ty = a.attribute("type").unwrap_or("fit");
+            conform = ty != "none";
+            // the clip's own adjust-conform overrides this and reports for itself
+            if ty == "fill" && !elements(el).any(|c| c.has_tag_name("adjust-conform")) {
+                self.report.warn("adjust-conform \"fill\" is not supported; the clip was fitted to the frame instead");
+            }
+        }
         for a in elements(el) {
             match (a.tag_name().name(), kind) {
+                ("adjust-conform", TrackKind::Video) => match a.attribute("type").unwrap_or("fit") {
+                    "none" => conform = false,
+                    "fill" => {
+                        conform = true;
+                        self.report.warn("adjust-conform \"fill\" is not supported; the clip was fitted to the frame instead");
+                    }
+                    _ => conform = true,
+                },
                 ("adjust-transform", TrackKind::Video) => {
                     let to_px = move |v: &str| {
                         let (x, y) = pair(v);
@@ -661,6 +741,9 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 }
                 _ => {}
             }
+        }
+        if kind == TrackKind::Video {
+            ti.scale_to_frame = conform;
         }
     }
 
@@ -1133,6 +1216,10 @@ impl Exp<'_, '_> {
             if it.speed == 0.0 || it.frame_hold.is_some() { local } else { local + Tick(((t - it.source_in).0 as f64 / it.speed).round() as i64) }
         };
         if kind == TrackKind::Video {
+            // a clip without scale-to-frame keeps its native pixels; an absent element would mean `fit`
+            if !it.scale_to_frame {
+                children.push("<adjust-conform type=\"none\"/>".into());
+            }
             self.transform(it, seq, &to_local, &mut children);
         }
         if let Some(a) = audio.or((kind == TrackKind::Audio).then_some(it)) {
@@ -1402,23 +1489,26 @@ mod tests {
         assert_eq!(scaled(Tick(2), 3.0), Tick(6));
     }
 
-    /// A chain of connected clips nested deeper than the layout bound is cut off with a warning.
+    /// Connected clips are never recursed into past the depth bound: a chain within it imports
+    /// whole, and a deeper one is cut off with a warning instead of exhausting the stack.
     #[test]
     fn deeply_nested_connected_clips_are_cut_off_not_recursed_into() {
-        let n: usize = 60;
-        let mut inner = String::new();
-        for _ in 0..n {
-            inner.push_str(r#"<asset-clip ref="r2" lane="1" offset="0s" duration="1s" name="c">"#);
-        }
-        for _ in 0..n {
-            inner.push_str("</asset-clip>");
-        }
-        let doc = doc_with_time_map("").replace("<timeMap></timeMap>", &inner);
+        let nested = |n: usize| {
+            let open = r#"<asset-clip ref="r2" lane="1" offset="0s" duration="1s" name="c">"#.repeat(n);
+            doc_with_time_map("").replace("<timeMap></timeMap>", &(open + &"</asset-clip>".repeat(n)))
+        };
+        let (shallow, deep) = (nested(60), nested(MAX_XML_DEPTH + 10));
         // (a thread with a generous stack: this crate's tests are built unoptimised)
         let handle = std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || crate::import_with(doc.as_bytes(), crate::Format::Fcpxml, &Default::default()).map(|(_, r)| r.mentions("levels deep")))
+            .spawn(move || {
+                let import =
+                    |d: &str| crate::import_with(d.as_bytes(), crate::Format::Fcpxml, &Default::default()).map(|(_, r)| r.mentions("nested too deeply"));
+                (import(&shallow), import(&deep))
+            })
             .unwrap();
-        assert_eq!(handle.join().unwrap(), Ok(true));
+        let (shallow, deep) = handle.join().unwrap();
+        assert_eq!(shallow, Ok(false));
+        assert_eq!(deep, Ok(true));
     }
 }
